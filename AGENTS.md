@@ -94,6 +94,22 @@ See `README.md` for usage.
   chunks for `createServerReference("<id>", …, "fetchSubscriptionAction")` (one walk for all accounts, ≤1 per
   10 min) and reads again; `MUSE_SUBSCRIPTION_ACTION_ID` sets the starting id, `tools/capture-subaction.mjs` is the
   manual fallback.
+- One browser per account, sign-in to chat: every request to Muse/Meta shows the UA + `sec-ch-ua*` of the Chromium in
+  use, read once per process by `browserIdentity()` (muse-driver; `HeadlessChrome/` read as `Chrome/`). Browser launches
+  set Playwright's `userAgent` from it (keeps the client hints; `--user-agent` drops the full version list) and
+  `grabCookies` hands it to the noise client (`useBrowserIdentity`), whose REST/RSC fetches send UA + `sec-ch-ua*` and
+  whose WS handshake sends the UA only (Chrome sends no client hints there). Never hard-code a UA for a Muse request.
+- `MUSE_TLS=wreq` (noise): every REST call goes through `MuseNoiseClient.http()` (wreq-js preset `chrome`, own pool per
+  client — accounts never share a connection — `disableDefaultHeaders`, headers in Chrome's order) and the Noise WS through
+  `wreq.websocket` with NO preset (a preset adds its navigation headers + a Chrome-149 `sec-ch-ua` to the upgrade) and the
+  hello spelled out in `WS_TLS` (`tlsOptions` replace a preset's TLS, they do not layer). Never call the global `fetch`
+  or `ws` directly in muse-noise. Check a change by capturing the ClientHello locally (JA4), never against a third-party echo.
+  wreq's newest preset is Chrome 149, so `MUSE_TLS=wreq` MUST pair with `MUSE_CHROME_PATH=<Chrome-for-Testing 149>` (the
+  sign-in/cookie browser, which `browserIdentity()` reads the UA from): UA and TLS both say 149, no 153-UA-over-149-TLS tell.
+  `rest()` sends `content-type`/`origin` only on a non-GET and `priority: u=1, i` (Chrome's fetch headers); do not add
+  `content-type` or `origin` to a GET. Residual, unfixable in wreq: the WS upgrade omits `Sec-WebSocket-Extensions:
+  permessage-deflate` (wreq has no permessage-deflate — offering it would break frames if the gateway accepted it), and
+  the ML-DSA sigalgs + trust-anchors extension of Chrome 153 cannot be set (why 149, not 153).
 - Attachments go on the hidden composer `input[type="file"]` via `setInputFiles`.
 - **Never** commit secrets: no `accounts/` (Chrome/Muse profiles), no `*.har`, no tokens.
 - Credentials **never** live in code — `.env` (git-ignored) or the real environment is the

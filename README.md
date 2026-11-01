@@ -490,6 +490,7 @@ opencode, Cursor, Cline, Aider, … anything that can read files.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MUSE_TRANSPORT` | `browser` | `browser` (drive Chrome) or `noise` (headless, no Chrome — see below) |
+| `MUSE_TLS` | `node` | (noise) `wreq` sends the REST calls and the Noise WebSocket through [wreq-js](https://github.com/sqdshguy/wreq-js) (BoringSSL with Chrome's TLS ClientHello and HTTP/2 SETTINGS, one connection pool per account) instead of Node's OpenSSL, whose ClientHello no browser sends; `node` keeps Node's `fetch` + `ws`. Pair with `MUSE_CHROME_PATH=<Chrome-for-Testing 149>` so the sign-in UA (149) matches wreq's TLS profile (Chrome 149) |
 | `MUSE_PROFILE_DIR` | `./accounts/acc1` | dedicated Chrome profile (holds your login) |
 | `MUSE_URL` | `https://muse.ai/` | app URL |
 | `MUSE_CHANNEL` | `chrome` | `chrome` or `msedge` |

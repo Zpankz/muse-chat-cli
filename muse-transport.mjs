@@ -21,8 +21,8 @@ import path from 'node:path'
 import fs, { promises as fsp } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { accountCreds, loadDotEnv } from './muse-env.mjs'
-import { driver, MuseDriver, clearStaleSingleton } from './muse-driver.mjs'
-import { MuseNoiseClient, abortedError, isMuseSorry, museSorryError } from './muse-noise.mjs'
+import { driver, MuseDriver, clearStaleSingleton, browserIdentity } from './muse-driver.mjs'
+import { MuseNoiseClient, abortedError, isMuseSorry, museSorryError, useBrowserIdentity } from './muse-noise.mjs'
 import { flattenTransparent } from './muse-image.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -41,9 +41,12 @@ const log = (...a) => console.error('[muse-transport]', ...a)
 // Read login cookies from a persistent profile without keeping a browser open.
 async function grabCookies(profileDir = PROFILE_DIR) {
   const { chromium } = await import('playwright-core')
+  const identity = await browserIdentity()
+  useBrowserIdentity(identity) // the noise client then shows Muse the browser these cookies were read with
   clearStaleSingleton(profileDir) // a killed server leaves Chrome's singleton files behind
   const ctx = await chromium.launchPersistentContext(profileDir, {
     ...(CHROME_PATH ? { executablePath: CHROME_PATH } : { channel: CHANNEL }), headless: true, viewport: { width: 1366, height: 900 },
+    userAgent: identity['user-agent'],
     args: ['--no-sandbox', '--disable-gpu', '--disable-blink-features=AutomationControlled', '--disk-cache-size=67108864'],
   })
   try {

@@ -29,6 +29,9 @@ importers:
       pngjs:
         specifier: 7.0.0
         version: 7.0.0
+      wreq-js:
+        specifier: 3.2.0
+        version: 3.2.0
       ws:
         specifier: ^8.22.0
         version: 8.22.0
@@ -56,6 +59,64 @@ packages:
     peerDependenciesMeta:
       '@cfworker/json-schema':
         optional: true
+
+  '@wreq-js/binding-android-arm64@3.2.0':
+    resolution: {integrity: sha512-PRsy18Z+0fftLeDvFTQwpgdepihRk6oVzdQWt92hEdarI7DexhgDJvvZfDsylMp7GDfsys9sFks8nIAi4n7eKQ==}
+    engines: {node: '>=20.0.0'}
+    cpu: [arm64]
+    os: [android]
+
+  '@wreq-js/binding-darwin-arm64@3.2.0':
+    resolution: {integrity: sha512-TGbgqj7YKp6m2p79hyLtTBatKgU8SKEVL5e903KGSeSDKkLbgk8knFoZ2MakhJnlqKZhvLPCNLT7A3AStwIoHQ==}
+    engines: {node: '>=20.0.0'}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@wreq-js/binding-darwin-x64@3.2.0':
+    resolution: {integrity: sha512-89JkGsik49nUcQR7HfO6M+Na3whkhAQBghVFWn+vGmz32RzTX+HVy6q7wThjN+XGT+xvn9ZQpzTie3B292S50g==}
+    engines: {node: '>=20.0.0'}
+    cpu: [x64]
+    os: [darwin]
+
+  '@wreq-js/binding-linux-arm64-gnu@3.2.0':
+    resolution: {integrity: sha512-WXqMK7AtOxMJAdwDpnAdDq0NZqf6wuRucKCQWQSLdSTUyTEuGo2anRkUsZwqvHbLrkWCTXNfl1hAfA+wIk/4kw==}
+    engines: {node: '>=20.0.0'}
+    cpu: [arm64]
+    os: [linux]
+    libc: [glibc]
+
+  '@wreq-js/binding-linux-arm64-musl@3.2.0':
+    resolution: {integrity: sha512-YSMWs3BNBCNhWvIAUHWyp2K/L17qxfaRTl+t97ykOIOIKZSduNYZn/Yn3hTNtpbdfrTmNMG9pltEcbixFKS4xQ==}
+    engines: {node: '>=20.0.0'}
+    cpu: [arm64]
+    os: [linux]
+    libc: [musl]
+
+  '@wreq-js/binding-linux-x64-gnu@3.2.0':
+    resolution: {integrity: sha512-6N7C1uc1qieM23rdKR5k07hfS50hVFExVHzLhHiWbmk9NyqBj0xyj2Mh5ThIrvz/or/6Pe79P8D7UWbl4aJTkw==}
+    engines: {node: '>=20.0.0'}
+    cpu: [x64]
+    os: [linux]
+    libc: [glibc]
+
+  '@wreq-js/binding-linux-x64-musl@3.2.0':
+    resolution: {integrity: sha512-0h0xJsmhVlmh+vHs9dYMIp5lpkKGNZrSedkl2Mh9XmR5slBahTcHT7oEEclhV+aNcY3V2Afmmqfil5huL+yDpA==}
+    engines: {node: '>=20.0.0'}
+    cpu: [x64]
+    os: [linux]
+    libc: [musl]
+
+  '@wreq-js/binding-win32-arm64-msvc@3.2.0':
+    resolution: {integrity: sha512-6bfaVFfbI61s5YLgQL+43uURk/VuOu7TPlUwY1l0Q9yJdWzD+Jpdokgl5cEiY2a0FEAw8Q4LqPI+XZT3YAMnQA==}
+    engines: {node: '>=20.0.0'}
+    cpu: [arm64]
+    os: [win32]
+
+  '@wreq-js/binding-win32-x64-msvc@3.2.0':
+    resolution: {integrity: sha512-w4aktLElPgBXkWC/v9Ti9np6jBjYOzIyqmzgT41V/zuDq/V+V7s/13f9OzcX5hObH2WOpajo0KeljTJ2aRExNQ==}
+    engines: {node: '>=20.0.0'}
+    cpu: [x64]
+    os: [win32]
 
   accepts@2.0.0:
     resolution: {integrity: sha512-5cvg6CtKwfgdmVqY1WIiXKc3Q1bkRqGLi+2W/6ao+6Y7gu/RCwRuAhGEzh5B4KlszSuTLgZYuqFqo5bImjNKng==}
@@ -418,6 +479,10 @@ packages:
   wrappy@1.0.2:
     resolution: {integrity: sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==}
 
+  wreq-js@3.2.0:
+    resolution: {integrity: sha512-dawhEbhvd5hxivKZSvv/mAQGO3mwZYESyctOvIIZ/H3DvQJzUM2UoFQsij0fg7hIClQ/GEQgg+2259UcFwhpMQ==}
+    engines: {node: '>=20.0.0'}
+
   ws@8.22.0:
     resolution: {integrity: sha512-Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg==}
     engines: {node: '>=10.0.0'}
@@ -469,6 +534,33 @@ snapshots:
       zod-to-json-schema: 3.25.2(zod@3.25.76)
     transitivePeerDependencies:
       - supports-color
+
+  '@wreq-js/binding-android-arm64@3.2.0':
+    optional: true
+
+  '@wreq-js/binding-darwin-arm64@3.2.0':
+    optional: true
+
+  '@wreq-js/binding-darwin-x64@3.2.0':
+    optional: true
+
+  '@wreq-js/binding-linux-arm64-gnu@3.2.0':
+    optional: true
+
+  '@wreq-js/binding-linux-arm64-musl@3.2.0':
+    optional: true
+
+  '@wreq-js/binding-linux-x64-gnu@3.2.0':
+    optional: true
+
+  '@wreq-js/binding-linux-x64-musl@3.2.0':
+    optional: true
+
+  '@wreq-js/binding-win32-arm64-msvc@3.2.0':
+    optional: true
+
+  '@wreq-js/binding-win32-x64-msvc@3.2.0':
+    optional: true
 
   accepts@2.0.0:
     dependencies:
@@ -844,6 +936,18 @@ snapshots:
       isexe: 2.0.0
 
   wrappy@1.0.2: {}
+
+  wreq-js@3.2.0:
+    optionalDependencies:
+      '@wreq-js/binding-android-arm64': 3.2.0
+      '@wreq-js/binding-darwin-arm64': 3.2.0
+      '@wreq-js/binding-darwin-x64': 3.2.0
+      '@wreq-js/binding-linux-arm64-gnu': 3.2.0
+      '@wreq-js/binding-linux-arm64-musl': 3.2.0
+      '@wreq-js/binding-linux-x64-gnu': 3.2.0
+      '@wreq-js/binding-linux-x64-musl': 3.2.0
+      '@wreq-js/binding-win32-arm64-msvc': 3.2.0
+      '@wreq-js/binding-win32-x64-msvc': 3.2.0
 
   ws@8.22.0: {}
 

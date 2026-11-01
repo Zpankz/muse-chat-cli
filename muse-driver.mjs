@@ -101,6 +101,41 @@ export function clearStaleSingleton(profileDir, logger = log) {
   return true
 }
 
+/**
+ * The browser every request to Muse shows, read once per process from the Chromium in use: its UA with
+ * "HeadlessChrome" read as "Chrome" (headless gives itself away in the UA only, its client hints are the headed
+ * ones) and the client hints Chrome sends on every fetch. Browser launches take `userAgent` from it and grabCookies
+ * hands it to the noise client, so an account shows Muse one browser from sign-in to chat.
+ * → { 'user-agent', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform' }
+ */
+let identity = null
+export function browserIdentity() {
+  identity ??= (async () => {
+    const { chromium } = await import('playwright-core')
+    const browser = await chromium.launch({
+      ...(CHROME_PATH ? { executablePath: CHROME_PATH } : { channel: CHANNEL }),
+      headless: true, timeout: LAUNCH_TIMEOUT, args: ['--no-sandbox', '--disable-gpu'],
+    })
+    try {
+      const page = await browser.newPage()
+      // navigator.userAgentData exists in secure contexts only (not about:blank): serve a blank localhost page
+      await page.route('http://localhost/', (r) => r.fulfill({ contentType: 'text/html', body: '' }))
+      await page.goto('http://localhost/')
+      const { ua, brands, mobile, platform } = await page.evaluate(() => ({ ua: navigator.userAgent, ...navigator.userAgentData.toJSON() }))
+      return {
+        'user-agent': ua.replace('HeadlessChrome/', 'Chrome/'),
+        'sec-ch-ua': brands.map((b) => `"${b.brand}";v="${b.version}"`).join(', '),
+        'sec-ch-ua-mobile': mobile ? '?1' : '?0',
+        'sec-ch-ua-platform': `"${platform}"`,
+      }
+    } finally {
+      await browser.close().catch(() => {})
+    }
+  })()
+  identity.catch(() => { identity = null }) // a failed launch is tried again by the next caller
+  return identity
+}
+
 export class MuseDriver {
   // opts.headless overrides MUSE_HEADLESS for this instance (the noise pool re-signs accounts in on a server with no display)
   constructor(profileDir = process.env.MUSE_PROFILE_DIR || path.join(__dirname, 'accounts', 'acc1'), opts = {}) {
@@ -130,9 +165,11 @@ export class MuseDriver {
 
     const launchPersistent = async () => {
       clearStaleSingleton(this.profileDir) // leftovers from a killed run would block this launch
+      const { 'user-agent': userAgent } = await browserIdentity()
       return chromium.launchPersistentContext(this.profileDir, {
         ...(CHROME_PATH ? { executablePath: CHROME_PATH } : { channel: CHANNEL }),
         headless: this.headless,
+        userAgent,
         viewport: { width: 1366, height: 900 },
         acceptDownloads: false,
         ignoreDefaultArgs: ['--enable-automation'],

@@ -17,9 +17,17 @@
  *   POST /api/hatch/vm/wake {vm_id}
  *   POST /api/hatch/token   {vmAddress, vmName} -> {token, notary_token}
  *
- * The client is pure Node (WebCrypto + `ws`); it only needs the login cookies.
+ * The client is pure Node (WebCrypto + `ws`, or wreq-js with MUSE_TLS=wreq); it only needs the login cookies.
  */
 import { WebSocket } from 'ws'
+
+// TLS like Chrome: MUSE_TLS=wreq sends the REST calls and the WS handshake through wreq-js (BoringSSL with Chrome's
+// ClientHello and HTTP/2 SETTINGS) instead of Node's OpenSSL, whose ClientHello no browser sends (01/11: JA4
+// t13d5212h1_… for Node's fetch, t13d1516h2_8daaf6152771_… for Chrome). Its newest preset is Chrome 149: the ML-DSA
+// sigalgs and trust-anchors extension of Chrome 153 cannot be set, so Muse sees a real Chrome 149 hello.
+// MUSE_TLS=node (default) keeps Node's fetch + ws.
+const TLS = (process.env.MUSE_TLS || 'node').trim().toLowerCase()
+const wreq = TLS === 'wreq' ? await import('wreq-js') : null
 
 const C = globalThis.crypto || globalThis.webcrypto
 const LB_HOST = process.env.MUSE_NOISE_HOST || 'hatch.metaaivm.com'
@@ -337,16 +345,60 @@ export function parseFlightResult(txt) {
   return JSON.parse(line.slice(ref.length + 1))
 }
 
-// Headers of the real Chrome the app origin expects: without the client hints Cloudflare answers 403.
-const APP_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
-const CLIENT_HINTS = {
+// The browser every request shows (without the client hints Cloudflare answers the app origin 403). Defaults to the
+// Chromium 153 the shim signs in with; useBrowserIdentity() (from grabCookies) swaps in the one that read the cookies,
+// so an account shows Muse one browser from sign-in to chat.
+const BROWSER = {
+  'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36',
+  'sec-ch-ua': '"Chromium";v="153", "Not_A Brand";v="8"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Linux"',
+}
+export function useBrowserIdentity(headers) { Object.assign(BROWSER, headers) }
+const clientHints = () => ({
   'accept-encoding': 'gzip, deflate, br',
   'accept-language': 'en-US,en;q=0.9',
   'sec-ch-prefers-color-scheme': 'light',
-  'sec-ch-ua': '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
-  'sec-ch-ua-mobile': '?0',
-  'sec-ch-ua-platform': '"Linux"',
-  'user-agent': APP_UA,
+  ...BROWSER,
+})
+const wreqOs = () => ({ '"Windows"': 'windows', '"macOS"': 'macos', '"Android"': 'android' })[BROWSER['sec-ch-ua-platform']] || 'linux'
+// Chrome's order for a fetch(), the page's own headers between sec-ch-ua and sec-ch-ua-mobile (wreq sends them as given)
+const CHROME_HEAD = ['sec-ch-ua-platform', 'user-agent', 'sec-ch-ua']
+const CHROME_TAIL = ['sec-ch-ua-mobile', 'accept', 'origin', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'referer', 'accept-encoding', 'accept-language', 'cookie', 'priority']
+function chromeOrder(headers) {
+  const h = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v)]))
+  const pick = (names) => names.filter((n) => n in h).map((n) => [n, h[n]])
+  const fixed = new Set([...CHROME_HEAD, ...CHROME_TAIL])
+  return [...pick(CHROME_HEAD), ...Object.entries(h).filter(([n]) => !fixed.has(n)), ...pick(CHROME_TAIL)]
+}
+// Chrome's ClientHello for a WebSocket (http/1.1 only, so no ALPS), spelled out: wreq's Chrome preset would also put its
+// navigation headers (Accept: text/html, Sec-Fetch-*, a Chrome 149 sec-ch-ua) on the upgrade request, and tlsOptions
+// replace a preset's TLS instead of layering on it. Matches Chrome 149's WS hello (JA4 t13d1515h1_8daaf6152771_0a20fe35d3a5).
+const WS_TLS = {
+  cipherList: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:' +
+    'ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:' +
+    'ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA',
+  curvesList: 'X25519MLKEM768:X25519:P-256:P-384',
+  sigalgsList: 'ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:' +
+    'rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512',
+  greaseEnabled: true, enableEchGrease: true, permuteExtensions: true, enableOcspStapling: true, enableSignedCertTimestamps: true,
+  certificateCompressionAlgorithms: ['brotli'], sessionTicket: true, preSharedKey: true, renegotiation: true,
+  preserveTls13CipherList: true, aesHwOverride: true, alpnProtocols: ['HTTP1'], alpsProtocols: [],
+}
+// A wreq-js WebSocket through the slice of the `ws` API this client uses (message/close/error events, send, close, readyState)
+function wreqWs(sock) {
+  const listeners = { message: [], close: [], error: [] }
+  const emit = (type, ...a) => { for (const f of listeners[type]) f(...a) }
+  sock.binaryType = 'nodebuffer'
+  sock.onmessage = (ev) => emit('message', ev.data)
+  sock.onclose = (ev) => emit('close', ev.code, ev.reason)
+  sock.onerror = (ev) => emit('error', new Error(ev.message || 'websocket error'))
+  return {
+    on(type, f) { listeners[type]?.push(f); return this },
+    send: (data) => sock.send(data),
+    close: () => sock.close(),
+    get readyState() { return sock.readyState },
+  }
 }
 // The client bundle declares each action as createServerReference("<id>", x.callServer, void 0, x.findSourceMapURL, "<name>").
 const ACTION_RE = /"([0-9a-f]{40,})"\s*,[^"]{0,160}?"fetchSubscriptionAction"/
@@ -362,8 +414,8 @@ function refreshSubscriptionAction(client) {
   if (Date.now() - actionRefreshAt < ACTION_REFRESH_MS) return Promise.resolve(false)
   actionRefresh = (async () => {
     const t0 = Date.now()
-    const page = await fetch(client.origin + '/', {
-      headers: { ...CLIENT_HINTS, accept: 'text/html', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', 'sec-fetch-site': 'none', cookie: client.cookieHeader },
+    const page = await client.http(client.origin + '/', {
+      headers: { ...clientHints(), accept: 'text/html', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', 'sec-fetch-site': 'none', cookie: client.cookieHeader },
       redirect: 'manual',
     })
     if (page.status !== 200) throw new Error(`app page -> ${page.status} (signed out?)`)
@@ -373,7 +425,7 @@ function refreshSubscriptionAction(client) {
     for (const m of (await page.text()).matchAll(CHUNK_RE)) add(m[0])
     while (queue.length && seen.size <= 1500) {
       const batch = queue.splice(0, 16)
-      const texts = await Promise.all(batch.map((u) => fetch(u, { headers: { 'user-agent': APP_UA } }).then((r) => (r.ok ? r.text() : '')).catch(() => '')))
+      const texts = await Promise.all(batch.map((u) => client.http(u, { headers: BROWSER }).then((r) => (r.ok ? r.text() : '')).catch(() => '')))
       for (const t of texts) {
         const m = t.match(ACTION_RE)
         if (m) {
@@ -443,10 +495,9 @@ function turnTracker() {
 }
 
 export class MuseNoiseClient {
-  constructor({ cookies, origin = 'https://muse.ai', ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', log = () => {} } = {}) {
+  constructor({ cookies, origin = 'https://muse.ai', log = () => {} } = {}) {
     this.cookieHeader = Array.isArray(cookies) ? cookies.map((c) => `${c.name}=${c.value}`).join('; ') : (cookies || '')
     this.origin = origin
-    this.ua = ua
     this.log = log
     this.ws = null
     this.transport = null
@@ -455,20 +506,31 @@ export class MuseNoiseClient {
     this._pumping = false
     this.sessions = new Set() // session ids of turns running on this connection ('' = primary), for cancelAll()
     this.closing = false // set by cancelAll(): no new turn starts on this connection
+    this._pool = null // wreq-js connection pool of this client (MUSE_TLS=wreq)
+  }
+  // fetch() for every request of this client: Node's, or wreq-js on this client's own pool so two accounts never share a
+  // connection (Node's fetch pools them process-wide). wreq adds no header of its own: Chrome's always-sent ones go here.
+  async http(url, init = {}) {
+    if (!wreq) return fetch(url, init)
+    this._pool ??= wreq.createTransport({ browser: 'chrome', os: wreqOs() })
+    const headers = chromeOrder({ 'accept-language': 'en-US,en;q=0.9', ...init.headers, 'accept-encoding': 'gzip, deflate, br, zstd' })
+    return wreq.fetch(url, { ...init, headers, transport: await this._pool, disableDefaultHeaders: true })
   }
   async rest(method, path, body) {
-    const res = await fetch(this.origin + path, {
+    const res = await this.http(this.origin + path, {
       method,
       headers: {
-        'content-type': 'application/json',
+        // Chrome sends content-type and origin only on a non-GET; a bodyless GET that carries either is a tell
+        ...(body ? { 'content-type': 'application/json' } : {}),
         cookie: this.cookieHeader,
-        origin: this.origin,
+        ...(method === 'GET' || method === 'HEAD' ? {} : { origin: this.origin }),
         referer: this.origin + '/',
         accept: '*/*',
-        'user-agent': this.ua,
+        ...BROWSER,
         'sec-fetch-site': 'same-origin',
         'sec-fetch-mode': 'cors',
         'sec-fetch-dest': 'empty',
+        priority: 'u=1, i',
       },
       body: body ? JSON.stringify(body) : undefined,
     })
@@ -485,10 +547,10 @@ export class MuseNoiseClient {
   // = Muse redeployed: look up the new action id once, then read again.
   async usage({ includeAgreement = true } = {}, retried = false) {
     const id = subscriptionActionId
-    const res = await fetch(this.origin + '/', {
+    const res = await this.http(this.origin + '/', {
       method: 'POST',
       headers: {
-        ...CLIENT_HINTS,
+        ...clientHints(),
         accept: 'text/x-component',
         'content-type': 'text/plain;charset=UTF-8',
         'next-action': id,
@@ -498,6 +560,7 @@ export class MuseNoiseClient {
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'same-origin',
         cookie: this.cookieHeader,
+        priority: 'u=1, i',
       },
       body: JSON.stringify([{ includeAgreement }]),
     })
@@ -535,10 +598,17 @@ export class MuseNoiseClient {
   async connect() {
     const { url } = await this.bootstrap()
     const ws = await new Promise((resolve, reject) => {
-      const w = new WebSocket(url, { headers: { origin: this.origin, 'user-agent': this.ua, cookie: this.cookieHeader } })
+      setTimeout(() => reject(new Error('ws open timeout')), 15000)
+      if (wreq) {
+        // Chrome's upgrade request, in its order (no client hints on a WS handshake)
+        const headers = [['Pragma', 'no-cache'], ['Cache-Control', 'no-cache'], ['User-Agent', BROWSER['user-agent']], ['Origin', this.origin],
+          ['Accept-Encoding', 'gzip, deflate, br, zstd'], ['Accept-Language', 'en-US,en;q=0.9'], ['Cookie', this.cookieHeader]]
+        wreq.websocket(url, { emulation: { tlsOptions: WS_TLS }, headers }).then((s) => resolve(wreqWs(s)), reject)
+        return
+      }
+      const w = new WebSocket(url, { headers: { origin: this.origin, 'user-agent': BROWSER['user-agent'], cookie: this.cookieHeader } }) // Chrome sends no client hints on a WS handshake
       w.on('open', () => resolve(w))
       w.on('error', reject)
-      setTimeout(() => reject(new Error('ws open timeout')), 15000)
     })
     this.ws = ws
     await this._handshake(ws)
@@ -1094,7 +1164,10 @@ export class MuseNoiseClient {
       this.sessions.delete(sid)
     }
   }
-  close() { this._pumping = false; try { this.ws?.close() } catch {} this.ws = null; this.transport = null }
+  close() {
+    this._pumping = false; try { this.ws?.close() } catch {} this.ws = null; this.transport = null
+    this._pool?.then((t) => t.close()).catch(() => {}); this._pool = null
+  }
 }
 
 // Reads binary WS frames as they arrive; next() returns the next complete frame.
