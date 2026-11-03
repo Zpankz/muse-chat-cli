@@ -102,7 +102,9 @@ See `README.md` for usage.
 - `MUSE_TLS=wreq` (noise): every REST call goes through `MuseNoiseClient.http()` (wreq-js preset `chrome`, own pool per
   client — accounts never share a connection — `disableDefaultHeaders`, headers in Chrome's order) and the Noise WS through
   `wreq.websocket` with NO preset (a preset adds its navigation headers + a Chrome-149 `sec-ch-ua` to the upgrade) and the
-  hello spelled out in `WS_TLS` (`tlsOptions` replace a preset's TLS, they do not layer). Never call the global `fetch`
+  hello spelled out in `WS_TLS` (`tlsOptions` replace a preset's TLS, they do not layer). A wreq `Transport` has no
+  finalizer and holds ~0.8 MB native until `close()`: `close()` every `MuseNoiseClient`, including one made for a single
+  read (`usage`/`_checkQuota`/`_checkVm`) or whose `connect()` failed. Never call the global `fetch`
   or `ws` directly in muse-noise. Check a change by capturing the ClientHello locally (JA4), never against a third-party echo.
   wreq's newest preset is Chrome 149, so `MUSE_TLS=wreq` MUST pair with `MUSE_CHROME_PATH=<Chrome-for-Testing 149>` (the
   sign-in/cookie browser, which `browserIdentity()` reads the UA from): UA and TLS both say 149, no 153-UA-over-149-TLS tell.

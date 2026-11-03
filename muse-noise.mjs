@@ -506,7 +506,9 @@ export class MuseNoiseClient {
     this._pumping = false
     this.sessions = new Set() // session ids of turns running on this connection ('' = primary), for cancelAll()
     this.closing = false // set by cancelAll(): no new turn starts on this connection
-    this._pool = null // wreq-js connection pool of this client (MUSE_TLS=wreq)
+    // wreq-js connection pool of this client (MUSE_TLS=wreq): ~0.8 MB of native memory that only close() frees (no
+    // finalizer) — every client must be closed, a one-off one too (unclosed meter reads grew the shim 0.35 GB/h, 03/11)
+    this._pool = null
   }
   // fetch() for every request of this client: Node's, or wreq-js on this client's own pool so two accounts never share a
   // connection (Node's fetch pools them process-wide). wreq adds no header of its own: Chrome's always-sent ones go here.

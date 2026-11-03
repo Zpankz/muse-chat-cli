@@ -319,7 +319,8 @@ class NoiseTransport {
     if (!a.expired) { // a signed-out account is read again once its sign-in brings new cookies
       try {
         const cookies = a.cookies || await this._grabCookies(a)
-        const { state } = await new MuseNoiseClient({ cookies, log }).vmState()
+        const c = new MuseNoiseClient({ cookies, log })
+        const { state } = await c.vmState().finally(() => c.close())
         a.vmDisabled.checkedAt = Date.now()
         if (state !== 'DISABLED') {
           log(`vm: ${a.id} VM is ${state || 'not reported'} again — back in the auto pool`)
@@ -415,7 +416,7 @@ class NoiseTransport {
       try {
         const cookies = a.cookies || await this._grabCookies(a)
         const c = new MuseNoiseClient({ cookies, log })
-        await c.connect()
+        try { await c.connect() } catch (e) { c.close(); throw e }
         a.client = c
         if (this.quotaEveryMs && !a.quota) this._checkQuota(a) // first connect: learn the quota before many turns land here
         return c
@@ -698,8 +699,9 @@ class NoiseTransport {
   _checkQuota(a) {
     if (a.quotaChecking) return a.quotaChecking
     a.quotaChecking = (async () => {
+      let tmp = null // a client made for this read only: closed after it (see MuseNoiseClient.close)
       try {
-        const c = a.client || new MuseNoiseClient({ cookies: a.cookies, log })
+        const c = a.client || (tmp = new MuseNoiseClient({ cookies: a.cookies, log }))
         const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('usage read timed out')), 30000).unref())
         this._noteQuota(a, await Promise.race([c.usage(), timeout]))
       } catch (e) {
@@ -707,6 +709,7 @@ class NoiseTransport {
         a.quotaError = e.message
         this._expire(a, e)
       } finally {
+        tmp?.close()
         a.quotaChecking = null
       }
     })()
@@ -855,9 +858,10 @@ class NoiseTransport {
     if (!c && !a.cookies && a.expired) {
       throw new Error(`${a.id} is signed out by Muse (${a.expired.reason}) — ${a.relogging ? 'signing in again' : 'waiting to sign in again'}`)
     }
-    if (!c) c = new MuseNoiseClient({ cookies: a.cookies || await this._grabCookies(a), log })
+    const tmp = c ? null : new MuseNoiseClient({ cookies: a.cookies || await this._grabCookies(a), log })
+    if (tmp) c = tmp
     let sub
-    try { sub = await c.usage() } catch (e) { this._expire(a, e); throw e }
+    try { sub = await c.usage() } catch (e) { this._expire(a, e); throw e } finally { tmp?.close() }
     this._noteQuota(a, sub) // a caller's read (console, muse_usage) refreshes the quota guard too
     return { ...sub, account: a.id, transport: 'noise' }
   }
