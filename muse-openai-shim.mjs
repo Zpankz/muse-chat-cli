@@ -636,11 +636,32 @@ async function handleChat(req, res, body) {
         try { validate = compileValidator(rfInfo.schema) }
         catch (e) { return sendError(res, 400, `Invalid JSON Schema: ${e.message}`, 'invalid_request_error', null, 'response_format') }
       }
-      const out = await runStructured(prompt, rfInfo, validate, { timeoutMs, newThread, files, chat, account, signal, flatten })
+      // stream: Muse's reply of each attempt goes out while it is written, as `muse_partial` {offset, text} next to an empty
+      // delta (OpenAI clients skip the field; the caller keeps text = text.slice(0, offset) + piece, offset < its length =
+      // a retry or failover started over), then the validated JSON as content. SSE starts with the first piece, so a turn
+      // that fails before Muse writes anything still gets its HTTP status.
+      let shown = ''
+      const onDelta = stream ? (full) => {
+        let at = 0
+        const max = Math.min(shown.length, full.length)
+        while (at < max && shown.charCodeAt(at) === full.charCodeAt(at)) at++
+        if (at === full.length && at === shown.length) return
+        if (!streamWriter) {
+          streamWriter = beginStream(res)
+          streamWriter.write(chunk(id, model, created, { role: 'assistant', content: '' }))
+        }
+        streamWriter.write(`data: ${JSON.stringify({
+          id, object: 'chat.completion.chunk', created, model,
+          choices: [{ index: 0, delta: {}, finish_reason: null }],
+          muse_partial: { offset: at, text: full.slice(at) },
+        })}\n\n`)
+        shown = full
+      } : undefined
+      const out = await runStructured(prompt, rfInfo, validate, { timeoutMs, newThread, files, chat, account, signal, flatten, onDelta })
       const jsonStr = JSON.stringify(out.obj)
       if (stream) {
-        const w = beginStream(res); streamWriter = w; const write = w.write
-        write(chunk(id, model, created, { role: 'assistant', content: '' }))
+        const w = streamWriter || beginStream(res); const first = !streamWriter; streamWriter = w; const write = w.write
+        if (first) write(chunk(id, model, created, { role: 'assistant', content: '' }))
         for (let i = 0; i < jsonStr.length; i += 60) write(chunk(id, model, created, { content: jsonStr.slice(i, i + 60) }))
         write(chunk(id, model, created, {}, 'stop'))
         if (body.stream_options && body.stream_options.include_usage) {
