@@ -21,3 +21,6 @@ Thumbs.db
 .idea/
 .vscode/
 captures/
+
+# rust
+target/
