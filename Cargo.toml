@@ -1,0 +1,24 @@
+[workspace]
+members = ["crates/mc"]
+resolver = "2"
+
+# Single version source for the Rust workspace: crates inherit it via
+# `version.workspace = true`, so `mc --version`, Cargo and the MCP
+# serverInfo can never drift. package.json (the Node package) stays
+# independently versioned — it is a different artifact.
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.88"
+
+# Optimised for a CLI that is invoked constantly: fat LTO + one codegen
+# unit maximises inlining across the incurs/reqwest graph, and
+# `panic = "abort"` drops the unwinding tables. Measured on this crate:
+# ~15 MB stripped, single-digit-ms startup for local surfaces.
+# Trade-off: release *build* takes longer (see `cargo build --release -p mc`);
+# debug builds are unaffected.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

@@ -270,7 +270,7 @@ async function chatForTools(prompt, body, opts) {
     const schema = forcedToolSchema(body, forced)
     const out = await runStructured(prompt, { mode: 'json_schema', schema, name: 'tool_calls' }, compileValidator(schema), opts)
     const reply = JSON.stringify(out.obj)
-    return { r: { reply, account: out.account }, calls: parseToolCalls(reply) }
+    return { r: { reply, account: out.account, sessionId: out.sessionId }, calls: parseToolCalls(reply) }
   }
   const r = await transport.chat(prompt, opts)
   return { r, calls: r.error && !r.reply ? null : parseToolCalls(r.reply) }
@@ -475,14 +475,14 @@ async function runStructured(basePrompt, rfInfo, validate, opts) {
       continue
     }
     if (validate) {
-      if (validate(ex.value)) { log(`schema attempt ${attempt}: valid${r.account ? ` (${r.account})` : ''}`); return { obj: ex.value, attempts: attempt, account: r.account } }
+      if (validate(ex.value)) { log(`schema attempt ${attempt}: valid${r.account ? ` (${r.account})` : ''}`); return { obj: ex.value, attempts: attempt, account: r.account, sessionId: r.sessionId } }
       const errs = (validate.errors || []).map((v) => `${v.instancePath || '/'} ${v.message}`)
       last = { obj: ex.value, errors: errs }
       prompt = basePrompt + corrective(errs, rfInfo)
       log(`schema attempt ${attempt}: invalid (${errs.length} errors)`)
       continue
     }
-    if (ex.value && typeof ex.value === 'object') return { obj: ex.value, attempts: attempt, account: r.account }
+    if (ex.value && typeof ex.value === 'object') return { obj: ex.value, attempts: attempt, account: r.account, sessionId: r.sessionId }
     last = { obj: ex.value, errors: ['expected a JSON object'] }
     prompt = basePrompt + corrective(last.errors, rfInfo)
   }
@@ -541,11 +541,12 @@ const sseHeaders = (res) => {
     'Access-Control-Allow-Origin': '*',
   })
 }
-const chunk = (id, model, created, delta, finish = null) =>
+const chunk = (id, model, created, delta, finish = null, extra = null) =>
   `data: ${JSON.stringify({
     id, object: 'chat.completion.chunk', created, model,
     choices: [{ index: 0, delta, finish_reason: finish }],
-  })}\n\n`
+    ...(extra || {}),
+  })}` + '\n\n'
 
 function sendError(res, status, message, type = 'invalid_request_error', code = null, param = null, extra = {}) {
   const body = JSON.stringify({ ...extra, error: { message, type, param, code } })
@@ -663,9 +664,9 @@ async function handleChat(req, res, body) {
         const w = streamWriter || beginStream(res); const first = !streamWriter; streamWriter = w; const write = w.write
         if (first) write(chunk(id, model, created, { role: 'assistant', content: '' }))
         for (let i = 0; i < jsonStr.length; i += 60) write(chunk(id, model, created, { content: jsonStr.slice(i, i + 60) }))
-        write(chunk(id, model, created, {}, 'stop'))
+        write(chunk(id, model, created, {}, 'stop', out.sessionId ? { session_id: out.sessionId } : null))
         if (body.stream_options && body.stream_options.include_usage) {
-          write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(jsonStr), total_tokens: approxTokens(prompt) + approxTokens(jsonStr) } })}\n\n`)
+          write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [], ...(out.account ? { account: out.account } : {}), ...(out.sessionId ? { session_id: out.sessionId } : {}), usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(jsonStr), total_tokens: approxTokens(prompt) + approxTokens(jsonStr) } })}` + '\n\n')
         }
         write('data: [DONE]\n\n')
         res.end()
@@ -675,6 +676,7 @@ async function handleChat(req, res, body) {
       res.end(JSON.stringify({
         id, object: 'chat.completion', created, model,
         ...(out.account ? { account: out.account } : {}),
+        ...(out.sessionId ? { session_id: out.sessionId } : {}),
         choices: [{ index: 0, message: { role: 'assistant', content: jsonStr }, finish_reason: 'stop' }],
         usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(jsonStr), total_tokens: approxTokens(prompt) + approxTokens(jsonStr) },
       }))
@@ -715,11 +717,12 @@ async function handleChat(req, res, body) {
         if (r.error && !emitted) throw new Error(r.error)
       }
 
-      write(chunk(id, model, created, {}, finishReason))
+      write(chunk(id, model, created, {}, finishReason, r.sessionId ? { session_id: r.sessionId } : null))
       if (body.stream_options && body.stream_options.include_usage) {
         write(`data: ${JSON.stringify({
           id, object: 'chat.completion.chunk', created, model, choices: [],
           ...(r.account ? { account: r.account } : {}),
+          ...(r.sessionId ? { session_id: r.sessionId } : {}),
           usage: { prompt_tokens: approxTokens(prompt), completion_tokens: approxTokens(emitted), total_tokens: approxTokens(prompt) + approxTokens(emitted) },
         })}\n\n`)
       }
@@ -742,6 +745,7 @@ async function handleChat(req, res, body) {
     res.end(JSON.stringify({
       id, object: 'chat.completion', created, model,
       ...(r.account ? { account: r.account } : {}),
+      ...(r.sessionId ? { session_id: r.sessionId } : {}),
       choices: [{ index: 0, message, finish_reason: calls && calls.length ? 'tool_calls' : 'stop' }],
       usage: {
         prompt_tokens: approxTokens(prompt),
@@ -865,6 +869,37 @@ export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}
       if (req.method === 'GET' && url === '/v1/muse/usage') {
         const params = new URL(req.url, 'http://localhost').searchParams
         const data = await transport.usage({ account: params.get('account') || undefined })
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        return res.end(JSON.stringify(data))
+      }
+
+      // Session lifecycle for orchestrators (`mc login|new|last`): same local-only
+      // /v1/muse/* guard as the reads above. Login is a POST because it may drive
+      // a sign-in; credentials come from the request body or the server's .env.
+      if (req.method === 'POST' && url === '/v1/muse/login') {
+        let body = {}
+        try { body = JSON.parse((await readBody(req)) || '{}') } catch { return sendError(res, 400, 'Invalid JSON body') }
+        const data = await transport.login({
+          timeoutMs: (Number(body.timeout_sec) || 300) * 1000,
+          email: body.email || undefined, metaPassword: body.meta_password || undefined,
+          mailPassword: body.mail_password || undefined, apiKey: body.mail_api_key || undefined,
+          auto: body.auto, account: body.account || undefined,
+        })
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        return res.end(JSON.stringify(data))
+      }
+
+      if (req.method === 'POST' && url === '/v1/muse/new') {
+        let body = {}
+        try { body = JSON.parse((await readBody(req)) || '{}') } catch { return sendError(res, 400, 'Invalid JSON body') }
+        const data = await transport.newChat({ account: body.account || undefined })
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        return res.end(JSON.stringify(data))
+      }
+
+      if (req.method === 'GET' && url === '/v1/muse/last') {
+        const params = new URL(req.url, 'http://localhost').searchParams
+        const data = await transport.readLast({ account: params.get('account') || undefined })
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }

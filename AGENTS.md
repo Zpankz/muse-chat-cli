@@ -46,7 +46,15 @@ See `README.md` for usage.
   `--self-test`, `--dump-dom`, `--serve-only`.
 - `muse-openai-shim.mjs` — OpenAI shim (`/v1/models`, `/v1/chat/completions`, `response_format`
   structured output, `/v1/muse/chats|chat|media|usage`).
-- `muse-cli.mjs` — CLI over the shim (`--json-schema` forces schema-valid JSON, `--usage` prints the meter).
+- `muse-cli.mjs` — legacy Node CLI over the shim (`--json-schema` forces schema-valid JSON, `--usage` prints the meter).
+- `crates/mc` (`mc`) — primary CLI: a Rust/incurs typed command graph over the shim
+  (`ask` root+command, `chats list|read|media`, `status`, `models`, `usage`, `pause|resume`,
+  `http`), exposed as CLI + MCP (`--mcp`) + HTTP/OpenAPI (`mc http`) + `--llms` manifests +
+  completions/skills from the one definition. It never reads credentials and never talks to
+  muse.ai directly — the Node server owns transports/accounts/quota. Browser-composer
+  timeouts surface as the stable error code `not_ready`. `main.rs` runs `normalize_argv`
+  (joins multi-word free text) before `serve_with`. Build: `cargo build --release -p mc`;
+  test: `cargo test -p mc`. See `docs/hatch-ios-api.md` (IPA confirms the same Noise API).
 - `tools/capture-noise.mjs` — Playwright capture harness (login + WS frames + JS bundles).
 - `tools/noise-chat.mjs` — end-to-end test of the headless client (`--history`, `MUSE_DUMP_EVENTS=1`).
 - `tools/discover-usage.mjs` / `tools/capture-subaction.mjs` — recon: open Settings→Usage, read the
