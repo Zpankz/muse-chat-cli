@@ -489,8 +489,8 @@ impl ShimClient {
     }
 
     /// Streaming chat over SSE. `on_delta` receives each incremental piece
-    /// of assistant text (already de-duplicated against the cumulative
-    /// stream and against `muse_partial` restarts). The returned reply
+    /// of validated assistant text. Provisional `muse_partial` updates are
+    /// ignored; structured output arrives as ordinary content after validation. The returned reply
     /// carries the full text; dropping the future aborts the HTTP request,
     /// which makes the shim cancel the Muse turn.
     pub async fn chat_stream<F: FnMut(String)>(
@@ -517,6 +517,8 @@ impl ShimClient {
         let mut account: Option<String> = None;
         let mut session_id: Option<String> = None;
         let mut tool_calls: Option<Value> = None;
+        let mut finished = false;
+        let mut done = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| ShimError::new("stream_error", e.to_string(), true))?;
             buf.extend_from_slice(&chunk);
@@ -527,40 +529,60 @@ impl ShimClient {
                 let line = raw_line.trim();
                 if let Some(data) = line.strip_prefix("data:") {
                     let data = data.trim();
-                    if data == "[DONE]" || data.is_empty() {
+                    if data.is_empty() {
                         continue;
                     }
-                    let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    if data == "[DONE]" {
+                        if !finished || done {
+                            return Err(ShimError::new("stream_error", "unexpected [DONE]", true));
+                        }
+                        done = true;
                         continue;
-                    };
+                    }
+                    let v = serde_json::from_str::<Value>(data).map_err(|e| {
+                        ShimError::new("stream_error", format!("invalid SSE data: {e}"), true)
+                    })?;
+                    if let Some(err) = v.get("error") {
+                        return Err(error_from_value(err));
+                    }
+                    if done {
+                        return Err(ShimError::new("stream_error", "data after [DONE]", true));
+                    }
+                    if finished {
+                        let usage_chunk = v.get("usage").is_some_and(|u| u.is_object())
+                            && v.get("choices")
+                                .and_then(Value::as_array)
+                                .is_some_and(|c| c.is_empty())
+                            && v.get("muse_partial").is_none();
+                        if !usage_chunk {
+                            return Err(ShimError::new(
+                                "stream_error",
+                                "unexpected data after finish_reason",
+                                true,
+                            ));
+                        }
+                    }
                     if let Some(a) = v.get("account").and_then(Value::as_str) {
                         account = Some(a.to_string());
                     }
                     if let Some(s) = session_id_from_value(&v) {
                         session_id = Some(s);
                     }
-                    if let Some(err) = v.get("error") {
-                        return Err(error_from_value(err));
-                    }
-                    // Structured-output turns stream `muse_partial {offset, text}`:
-                    // keep `emitted = emitted[..offset] + text` (a retry restarts at a lower offset).
-                    if let Some(p) = v.get("muse_partial") {
-                        let offset = p.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-                        let text = p.get("text").and_then(Value::as_str).unwrap_or("");
-                        // `offset` is a JS UTF-16 code-unit length, not a Rust char or byte
-                        // index. Walk `emitted` and keep the largest char-boundary-safe prefix
-                        // whose UTF-16 length is <= offset; a retry restarting at a lower
-                        // offset truncates back to that prefix, never mid-char.
-                        let next = apply_partial(&emitted, offset, text);
-                        let emitted_chars = emitted.chars().count();
-                        let next_chars: Vec<char> = next.chars().collect();
-                        if next_chars.len() > emitted_chars
-                            && next_chars[..emitted_chars].iter().collect::<String>() == emitted
-                        {
-                            on_delta(next_chars[emitted_chars..].iter().collect());
+                    if let Some(choices) = v.get("choices").and_then(Value::as_array) {
+                        for choice in choices {
+                            if let Some(reason) =
+                                choice.get("finish_reason").filter(|r| !r.is_null())
+                            {
+                                if finished || reason.as_str().is_none_or(str::is_empty) {
+                                    return Err(ShimError::new(
+                                        "stream_error",
+                                        "invalid or duplicate finish_reason",
+                                        true,
+                                    ));
+                                }
+                                finished = true;
+                            }
                         }
-                        emitted = next;
-                        continue;
                     }
                     let delta = &v["choices"][0]["delta"];
                     if let Some(tc) = delta.get("tool_calls") {
@@ -574,6 +596,13 @@ impl ShimClient {
                     }
                 }
             }
+        }
+        if !buf.iter().all(u8::is_ascii_whitespace) || !finished || !done {
+            return Err(ShimError::new(
+                "stream_error",
+                "incomplete SSE stream: expected finish_reason and [DONE]",
+                true,
+            ));
         }
         Ok(ChatReply {
             content: emitted.clone(),
@@ -606,31 +635,6 @@ pub async fn shim_healthy(base: &str) -> bool {
         return false;
     };
     matches!(client.health().await, Ok(v) if health_ok(&v))
-}
-
-/// Rebuild the cumulative text for a streamed `muse_partial {offset, text}`
-/// event: keep `emitted`'s prefix up to `offset`, then append `text`.
-///
-/// `offset` is a JavaScript UTF-16 code-unit length, so it is converted to a
-/// char-boundary-safe prefix: the largest prefix of `emitted` whose UTF-16
-/// length is `<= offset`. Offsets landing mid-char (a surrogate pair, or any
-/// multi-unit char) truncate back to the char boundary instead of panicking
-/// or splitting bytes. ASCII behaviour is byte-identical to a char take.
-fn apply_partial(emitted: &str, offset_utf16: usize, text: &str) -> String {
-    let mut units = 0usize;
-    let mut end = 0usize;
-    for (i, c) in emitted.char_indices() {
-        let next_units = units + c.len_utf16();
-        if next_units > offset_utf16 {
-            break;
-        }
-        units = next_units;
-        end = i + c.len_utf8();
-    }
-    let mut next = String::with_capacity(end + text.len());
-    next.push_str(&emitted[..end]);
-    next.push_str(text);
-    next
 }
 
 /// Split raw SSE bytes into complete `\n`-terminated lines, decoding each
@@ -797,25 +801,70 @@ pub fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn apply_partial_ascii_is_byte_identical() {
-        assert_eq!(apply_partial("", 0, "hello"), "hello");
-        assert_eq!(apply_partial("hello", 5, " world"), "hello world");
-        // Retry restarting at a lower offset truncates back.
-        assert_eq!(apply_partial("hello world", 5, "!"), "hello!");
+    async fn stub_stream(body: &str) -> (Result<ChatReply, ShimError>, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let received = socket.read(&mut request).await.unwrap();
+            assert!(
+                received > 0,
+                "client must send a request before the stub replies"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = ShimClient::new(&format!("http://{addr}")).unwrap();
+        let mut deltas = String::new();
+        let result = client
+            .chat_stream(
+                &ChatRequest {
+                    prompt: "test".into(),
+                    ..Default::default()
+                },
+                |s| deltas.push_str(&s),
+            )
+            .await;
+        server.await.unwrap();
+        (result, deltas)
     }
 
-    #[test]
-    fn apply_partial_utf16_offset_never_splits_a_char() {
-        // "héllo": h=1, é=1, l=1, l=1, o=1 UTF-16 units (é is 1 unit in UTF-16).
-        assert_eq!(apply_partial("héllo", 1, "X"), "hX");
-        // "𝄞x": 𝄞 is 2 UTF-16 units (surrogate pair), x is 1.
-        // Offset 1 lands mid-surrogate-pair: truncate back to "" — must not panic.
-        assert_eq!(apply_partial("𝄞x", 1, "y"), "y");
-        assert_eq!(apply_partial("𝄞x", 2, "y"), "𝄞y");
-        assert_eq!(apply_partial("𝄞x", 3, "y"), "𝄞xy");
-        // Oversized offset keeps the whole prefix.
-        assert_eq!(apply_partial("héllo", 99, "!"), "héllo!");
+    #[tokio::test]
+    async fn stream_requires_complete_terminal_sequence() {
+        let delta =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n";
+        let finish = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        let done = "data: [DONE]\n\n";
+        let usage = "data: {\"choices\":[],\"usage\":{\"total_tokens\":1}}\n\n";
+        for body in [
+            format!("{delta}{finish}{done}"),
+            format!("{delta}{finish}{usage}{done}"),
+        ] {
+            let (reply, emitted) = stub_stream(&body).await;
+            assert_eq!(reply.unwrap().content, "hello");
+            assert_eq!(emitted, "hello");
+        }
+        for body in [
+            delta.to_string(),
+            format!("{delta}{finish}"),
+            format!("{delta}{done}"),
+            format!("{delta}{finish}{finish}{done}"),
+            format!("{delta}{finish}{delta}{done}"),
+            format!("{delta}{finish}{done}{done}"),
+        ] {
+            let (reply, _) = stub_stream(&body).await;
+            assert_eq!(reply.unwrap_err().code, "stream_error");
+        }
+        let partial = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}],\"muse_partial\":{\"offset\":0,\"text\":\"unvalidated\"}}\n\n";
+        let (reply, emitted) = stub_stream(&format!("{partial}{delta}{finish}{done}")).await;
+        assert_eq!(reply.unwrap().content, "hello");
+        assert_eq!(emitted, "hello");
     }
 
     #[test]

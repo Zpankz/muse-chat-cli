@@ -74,6 +74,50 @@ fn argv_normalization_joins_free_text() {
     assert_eq!(n(v(&["ask", "one"])), v(&["ask", "one"]));
 }
 
+#[test]
+fn argv_normalization_preserves_values_and_delimiters() {
+    let n = mc::normalize_argv;
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    for args in [
+        &["--schema"][..],
+        &["--base"],
+        &["--help"],
+        &["help", "ask"],
+        &["ask", "--system"],
+        &["batch", "--concurrency"],
+        &["ask", "--system", "--no-stream", "hello"],
+        &["ask", "--system=--no-stream", "hello"],
+        &["doctor", "--base", "--manual"],
+        &["batch", "--concurrency", "--no-stream"],
+    ] {
+        assert_eq!(n(v(args)), v(args));
+    }
+    assert_eq!(
+        n(v(&["--", "--no-stream", "hello"])),
+        v(&["ask", "--", "--no-stream hello"])
+    );
+    assert_eq!(
+        n(v(&["ask", "--", "--no-stream", "hello"])),
+        v(&["ask", "--", "--no-stream hello"])
+    );
+    assert_eq!(
+        n(v(&["--schema", "help", "ask"])),
+        v(&["--schema", "help", "ask"])
+    );
+}
+
+#[tokio::test]
+async fn root_schema_help_and_missing_values_do_not_panic() {
+    let (code, out) = run(&["--schema", "--format", "json"]).await;
+    assert_eq!(code, None, "{out}");
+    assert!(serde_json::from_str::<Value>(&out).is_ok(), "{out}");
+    let (code, out) = run(&["--help"]).await;
+    assert_eq!(code, None, "{out}");
+    let (code, out) = run(&["--base"]).await;
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("VALIDATION_ERROR"), "{out}");
+}
+
 #[tokio::test]
 async fn help_lists_the_graph() {
     // Root help is `mc ask`'s (root = ask); the graph lives in --llms.

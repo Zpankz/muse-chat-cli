@@ -61,6 +61,10 @@ fn terr<T>(e: ShimError) -> TypedResult<T> {
 // ---------------------------------------------------------------- globals
 
 #[derive(Deserialize, incurs::Options)]
+#[expect(
+    dead_code,
+    reason = "derived schema; globals are read from the incurs context"
+)]
 struct Globals {
     /// Shim base URL (default: env MUSE_SHIM_URL or http://127.0.0.1:8787).
     #[incurs(alias = "b")]
@@ -155,6 +159,10 @@ fn absolutize_files(files: Vec<String>, cwd: &std::path::Path) -> Vec<String> {
 }
 
 #[derive(Deserialize, incurs::Options)]
+#[expect(
+    dead_code,
+    reason = "derived schema; streaming handler reads the incurs context"
+)]
 struct AskOptions {
     /// System prompt.
     #[incurs(alias = "s")]
@@ -240,22 +248,20 @@ fn ask_request(ctx: &CommandContext, prompt: String) -> Result<ChatRequest, Stri
 /// when a pipe is attached — `cat f | mc ask` must work. Only CLI
 /// invocations (no transport `request` metadata; MCP/HTTP always set
 /// it) with a non-TTY stdin may read it. Pure + injectable for tests.
-fn resolve_prompt(positional: String, stdin: Option<String>) -> Result<String, CommandResult> {
-    let prompt = if positional.trim() == "-" {
-        stdin.unwrap_or_default()
-    } else if positional.trim().is_empty() {
+fn resolve_prompt(positional: String, stdin: Option<String>) -> Result<String, Box<CommandResult>> {
+    let prompt = if positional.trim() == "-" || positional.trim().is_empty() {
         stdin.unwrap_or_default()
     } else {
         positional
     };
     if prompt.trim().is_empty() {
-        return Err(CommandResult::Error {
+        return Err(Box::new(CommandResult::Error {
             code: "missing_prompt".into(),
             message: "ask needs a prompt argument or stdin input (e.g. `mc ask \"hi\"` or `echo hi | mc ask`)".into(),
             retryable: false,
             exit_code: Some(2),
             cta: None,
-        });
+        }));
     }
     Ok(prompt.trim().to_string())
 }
@@ -323,7 +329,7 @@ impl CommandHandler for AskHandler {
         };
         let prompt = match resolve_prompt(positional, stdin) {
             Ok(p) => p,
-            Err(r) => return r,
+            Err(r) => return *r,
         };
         let req = match ask_request(&ctx, prompt.trim().to_string()) {
             Ok(r) => r,
@@ -527,6 +533,10 @@ struct ChatsListOptions {
 }
 
 #[derive(Deserialize, incurs::Options)]
+#[expect(
+    dead_code,
+    reason = "derived schema; manual handler reads the incurs context"
+)]
 struct ReadOptions {
     /// Max messages from the end.
     #[incurs(default = 100)]
@@ -536,6 +546,10 @@ struct ReadOptions {
 }
 
 #[derive(Deserialize, incurs::Options)]
+#[expect(
+    dead_code,
+    reason = "derived schema; manual handler reads the incurs context"
+)]
 struct MediaOptions {
     /// Download the media to disk.
     download: bool,
@@ -588,6 +602,10 @@ struct KeysCreateOptions {
 }
 
 #[derive(Deserialize, incurs::Options)]
+#[expect(
+    dead_code,
+    reason = "derived schema; streaming handler reads the incurs context"
+)]
 struct BatchOptions {
     /// One prompt per line from this file (`-` = stdin). Blank lines and
     /// `#` comments are skipped.
@@ -630,44 +648,11 @@ struct KeysUpdateOptions {
 /// - `mc hello world`            -> `mc ask "hello world"`
 /// - `mc ask Say exactly ok`     -> `mc ask "Say exactly ok"`
 /// - `mc chats read My Thread`   -> `mc chats read "My Thread"`
-/// - flags keep their values (`-s X`, `--schema F`, `--format json`, …)
+/// - flags keep their values (`-s X`, `--json-schema F`, `--format json`, …)
 /// - quoted / single-word / machine invocations pass through untouched
 ///
 /// MCP, HTTP and `tool_catalog()` never see this: they call commands by
 /// name with structured arguments, where `prompt` is already one string.
-/// mc's boolean flags (incurs derives `bool` as a value-taking option).
-/// A bare following `true`/`false` is that flag's value, never prompt
-/// text; `normalize_argv` rewrites a flag with no value to `--flag true`.
-/// Insert an explicit `true` after any bool flag that lacks a value.
-/// A following bare `true`/`false` is kept as the value.
-fn expand_bool_flags(argv: Vec<String>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(argv.len() + 4);
-    let mut k = 0;
-    while k < argv.len() {
-        let t = argv[k].clone();
-        if t == "--" {
-            out.extend_from_slice(&argv[k..]);
-            break;
-        }
-        out.push(t.clone());
-        if is_bool_flag(&t) {
-            match argv.get(k + 1).map(String::as_str) {
-                Some("true") | Some("false") => {}
-                _ => out.push("true".to_string()),
-            }
-        }
-        k += 1;
-    }
-    out
-}
-
-fn is_bool_flag(token: &str) -> bool {
-    matches!(
-        token,
-        "--new-thread" | "--no-stream" | "--download" | "--manual" | "--enable" | "--disable"
-    )
-}
-
 pub fn normalize_argv(argv: Vec<String>) -> Vec<String> {
     const COMMANDS: &[&str] = &[
         "ask",
@@ -703,7 +688,6 @@ pub fn normalize_argv(argv: Vec<String>) -> Vec<String> {
         "--file",
         "--chat",
         "--account",
-        "--schema",
         "--json-schema",
         "-b",
         "--base",
@@ -712,105 +696,91 @@ pub fn normalize_argv(argv: Vec<String>) -> Vec<String> {
         "--dir",
         "--max",
         "--addr",
+        "--token",
+        "--query",
+        "--timeout-sec",
+        "--name",
+        "--max-inflight",
+        "--concurrency",
         "--token-limit",
         "--token-offset",
         "--filter-output",
+        "--depth",
+        "--output",
+        "--command",
+        "--agent",
     ];
-    // Skip leading machine/global flags to find the command position.
+    const BOOL_FLAGS: &[&str] = &[
+        "--new-thread",
+        "--no-stream",
+        "--download",
+        "--manual",
+        "--enable",
+        "--disable",
+    ];
+    let mut out = Vec::with_capacity(argv.len() + 4);
+    let mut positionals = Vec::new();
+    let mut command: Option<String> = None;
+    let mut chats_subcommand = false;
+    let mut after_dd = false;
     let mut i = 0;
     while i < argv.len() {
         let t = &argv[i];
-        if t == "--" {
-            break;
-        }
-        if VALUE_FLAGS.contains(&t.as_str()) {
-            i += 2;
-            continue;
-        }
-        if t.starts_with('-') {
+        if !after_dd && t == "--" {
+            after_dd = true;
+            out.push(t.clone());
             i += 1;
             continue;
         }
-        break;
-    }
-    // Boolean-flag expansion must run BEFORE the command position is
-    // computed: inserting `true` shifts every later index, and a stale
-    // cmd_at would merge the command name into the prompt.
-    let argv = expand_bool_flags(argv);
-    let mut out = argv.clone();
-    // Recompute the command position on the expanded argv.
-    let mut i = 0;
-    while i < argv.len() {
-        let t = &argv[i];
-        if t == "--" {
-            break;
-        }
-        if VALUE_FLAGS.contains(&t.as_str()) || is_bool_flag(t) {
-            i += 2;
-            continue;
-        }
-        if t.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        break;
-    }
-    // Bare prompt: first real token is no command — route the line to ask.
-    if i >= argv.len() || !COMMANDS.contains(&argv[i].as_str()) {
-        out.insert(i, "ask".to_string());
-    }
-    // Join positionals of ask / chats read / chats media into one token.
-    let cmd_at = i;
-    let join_from = if out[cmd_at] == "ask" {
-        Some(cmd_at + 1)
-    } else if out[cmd_at] == "chats"
-        && matches!(
-            out.get(cmd_at + 1).map(String::as_str),
-            Some("read") | Some("media")
-        )
-    {
-        Some(cmd_at + 2)
-    } else {
-        None
-    };
-    if let Some(start) = join_from {
-        let mut pos: Vec<usize> = Vec::new();
-        let mut j = start;
-        let mut after_dd = false;
-        while j < out.len() {
-            let t = out[j].clone();
-            if !after_dd && t == "--" {
-                after_dd = true;
-                j += 1;
-                continue;
-            }
-            if !after_dd && t.starts_with('-') && t.len() > 1 {
-                // Bool flags now always carry a value token (inserted
-                // above), as does a VALUE_FLAG; both step over 2.
-                j += if VALUE_FLAGS.contains(&t.as_str()) || is_bool_flag(&t) {
-                    2
+        if !after_dd && t.starts_with('-') && t.len() > 1 {
+            out.push(t.clone());
+            if VALUE_FLAGS.contains(&t.as_str()) {
+                if let Some(value) = argv.get(i + 1) {
+                    out.push(value.clone());
+                    i += 1;
+                }
+            } else if BOOL_FLAGS.contains(&t.as_str()) {
+                if matches!(argv.get(i + 1).map(String::as_str), Some("true" | "false")) {
+                    i += 1;
+                    out.push(argv[i].clone());
                 } else {
-                    1
-                };
-                continue;
+                    out.push("true".to_string());
+                }
             }
-            // A `true`/`false` immediately after a bool flag is its
-            // value, already stepped over — positional collection only
-            // sees it if it starts the scan, which cannot happen since
-            // flags are stepped in pairs. Keep as positional otherwise.
-            pos.push(j);
-            j += 1;
+            i += 1;
+            continue;
         }
-        if pos.len() > 1 {
-            let joined = pos
-                .iter()
-                .map(|&k| out[k].clone())
-                .collect::<Vec<_>>()
-                .join(" ");
-            out[pos[0]] = joined;
-            for &k in pos[1..].iter().rev() {
-                out.remove(k);
+        if command.is_none() {
+            if !after_dd && COMMANDS.contains(&t.as_str()) {
+                command = Some(t.clone());
+            } else {
+                // Put the synthetic command before `--`, not after it.
+                let at = if after_dd { out.len() - 1 } else { out.len() };
+                out.insert(at, "ask".to_string());
+                command = Some("ask".to_string());
+                positionals.push(out.len());
             }
+        } else if command.as_deref() == Some("chats") && !chats_subcommand {
+            chats_subcommand = true;
+            command = Some(format!("chats {t}"));
+        } else if matches!(
+            command.as_deref(),
+            Some("ask" | "chats read" | "chats media")
+        ) {
+            positionals.push(out.len());
+        }
+        out.push(t.clone());
+        i += 1;
+    }
+    if positionals.len() > 1 {
+        let joined = positionals
+            .iter()
+            .map(|&k| out[k].as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        out[positionals[0]] = joined;
+        for &k in positionals[1..].iter().rev() {
+            out.remove(k);
         }
     }
     out
@@ -1052,11 +1022,11 @@ impl CommandHandler for BatchHandler {
 
 /// `mc doctor`: interpret status (+ best-effort usage) into verdicts an
 /// orchestrator can branch on, instead of dumping raw health JSON.
-fn doctor_report(health: &Value, usage: Option<&Value>) -> Value {
+fn doctor_report(health: &Value, usage: Option<&Value>, selected: Option<&str>) -> Value {
     let get = |k: &str| health.get(k).cloned().unwrap_or(Value::Null);
     let transport = get("transport");
     let is_noise = transport.as_str() == Some("noise");
-    let accounts: Vec<Value> = get("accounts")
+    let mut accounts: Vec<Value> = get("accounts")
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -1113,8 +1083,20 @@ fn doctor_report(health: &Value, usage: Option<&Value>) -> Value {
             })
         })
         .collect();
+    // A pinned diagnostic must not borrow readiness from a different
+    // account. An unknown id is also not a ready, empty pool.
+    if is_noise {
+        if let Some(id) = selected {
+            accounts.retain(|a| a["id"].as_str() == Some(id));
+        }
+    }
     let (verdict, next): (&str, &str) = if is_noise {
-        if accounts.iter().any(|a| a["verdict"] == "ready") {
+        if selected.is_some() && accounts.is_empty() {
+            (
+                "unknown_account",
+                "mc status (select an existing account id)",
+            )
+        } else if accounts.iter().any(|a| a["verdict"] == "ready") {
             ("ready", "mc ask \"hi\"")
         } else if accounts.iter().any(|a| a["verdict"] == "signed_out") {
             ("signed_out", "mc login (or wait for auto re-login)")
@@ -1143,6 +1125,7 @@ fn doctor_report(health: &Value, usage: Option<&Value>) -> Value {
         "verdict": verdict,
         "transport": transport,
         "base": get("base"),
+        "account": selected,
         "accounts": accounts,
         "usage": usage,
         "next": next,
@@ -1352,7 +1335,11 @@ pub fn build_cli() -> Cli {
                                 Value::String(settings_from(&ctx.globals).base),
                             );
                         }
-                        TypedResult::ok(doctor_report(&health, usage.as_ref()))
+                        TypedResult::ok(doctor_report(
+                            &health,
+                            usage.as_ref(),
+                            ctx.options.account.as_deref(),
+                        ))
                     }
                     Err(e) => terr(e),
                 },
@@ -1698,7 +1685,75 @@ mod argv_tests {
     // The normalize_argv matrix is exercised end-to-end (real binary and
     // the buffered test surface) in tests/cli.rs; keep one in-lib smoke
     // case so `cargo test -p mc --lib` covers it without a runtime.
-    use super::normalize_argv;
+    use super::{doctor_report, normalize_argv, AbortOnDrop};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn dropping_output_stream_aborts_its_pump() {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        let pump = tokio::spawn(async move {
+            let _resources = (tx, alive_tx);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let stream = AbortOnDrop {
+            inner: rx,
+            pump: Some(pump),
+        };
+        drop(stream);
+        // Resource drop proves the task was cancelled even without
+        // another delta/channel send.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), alive_rx)
+                .await
+                .expect("pump cancellation must release resources")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn doctor_does_not_borrow_another_accounts_readiness() {
+        let health = json!({
+            "transport": "noise",
+            "accounts": [
+                {"id": "a", "inPool": false, "signedOut": {"reason": "expired"}},
+                {"id": "b", "inPool": true}
+            ]
+        });
+        assert_eq!(doctor_report(&health, None, None)["verdict"], "ready");
+        let pinned = doctor_report(&health, None, Some("a"));
+        assert_eq!(pinned["verdict"], "signed_out");
+        assert_eq!(pinned["ok"], false);
+        assert_eq!(pinned["accounts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            doctor_report(&health, None, Some("missing"))["verdict"],
+            "unknown_account"
+        );
+    }
+
+    #[test]
+    fn doctor_preserves_purchased_and_unknown_token_balances() {
+        for (quota, expected) in [
+            (json!({"percentUsed": 100, "topupBalance": 10}), "ready"),
+            (json!({"percentUsed": 100}), "ready"),
+            (
+                json!({"percentUsed": 100, "topupBalance": 0}),
+                "out_of_quota",
+            ),
+            (json!({"status": "EXHAUSTED"}), "out_of_quota"),
+            (json!({"status": "EXCEEDED"}), "out_of_quota"),
+        ] {
+            let health = json!({
+                "transport": "noise",
+                "accounts": [{"id": "a", "inPool": true, "quota": quota}]
+            });
+            assert_eq!(doctor_report(&health, None, Some("a"))["verdict"], expected);
+        }
+    }
+
     #[test]
     fn joins_bare_prompt() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();

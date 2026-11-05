@@ -10,8 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde_json::Value;
-
 use crate::shim::{shim_healthy, ShimError};
 
 pub const DEFAULT_BASE: &str = "http://127.0.0.1:8787";
