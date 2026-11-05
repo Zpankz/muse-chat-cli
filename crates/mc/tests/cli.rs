@@ -37,6 +37,23 @@ fn argv_normalization_bools_and_help() {
 }
 
 #[test]
+fn argv_normalization_bool_before_command() {
+    let n = mc::normalize_argv;
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // A bool flag BEFORE the command/bare prompt must not merge the
+    // command name into the prompt (regression: indexes were computed
+    // before bool expansion shifted them).
+    assert_eq!(
+        n(v(&["--no-stream", "hello", "world"])),
+        v(&["--no-stream", "true", "ask", "hello world"])
+    );
+    assert_eq!(
+        n(v(&["--new-thread", "ask", "hello"])),
+        v(&["--new-thread", "true", "ask", "hello"])
+    );
+}
+
+#[test]
 fn argv_normalization_joins_free_text() {
     let n = mc::normalize_argv;
     let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();

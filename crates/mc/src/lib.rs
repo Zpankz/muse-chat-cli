@@ -136,6 +136,24 @@ fn free_text(value: Option<&Value>) -> String {
     }
 }
 
+fn absolutize_files(files: Vec<String>, cwd: &std::path::Path) -> Vec<String> {
+    files
+        .into_iter()
+        .map(|f| {
+            // Only local paths are rewritten; URLs/data URIs pass through.
+            if f.contains("://") || f.starts_with("data:") {
+                return f;
+            }
+            let p = std::path::Path::new(&f);
+            if p.is_absolute() {
+                f
+            } else {
+                cwd.join(p).to_string_lossy().into_owned()
+            }
+        })
+        .collect()
+}
+
 #[derive(Deserialize, incurs::Options)]
 struct AskOptions {
     /// System prompt.
@@ -197,15 +215,19 @@ fn ask_request(ctx: &CommandContext, prompt: String) -> Result<ChatRequest, Stri
             .get("new_thread")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        files: o
-            .get("file")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        // The shim resolves relative paths in ITS cwd, not the
+        // caller's — absolutize against the caller's cwd first.
+        files: absolutize_files(
+            o.get("file")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        ),
         chat: o.get("chat").and_then(Value::as_str).map(str::to_string),
         account: o.get("account").and_then(Value::as_str).map(str::to_string),
         json_schema: schema,
@@ -236,6 +258,31 @@ fn resolve_prompt(positional: String, stdin: Option<String>) -> Result<String, C
         });
     }
     Ok(prompt.trim().to_string())
+}
+
+/// A RecordStream that aborts its pump task when dropped: dropping
+/// the stream (consumer gone) aborts chat_stream, whose HTTP request
+/// drop makes the shim cancel the Muse turn instead of burning
+/// quota for nobody.
+struct AbortOnDrop {
+    inner: futures::channel::mpsc::UnboundedReceiver<StreamRecord>,
+    pump: Option<tokio::task::JoinHandle<()>>,
+}
+impl futures::Stream for AbortOnDrop {
+    type Item = StreamRecord;
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(p) = self.pump.take() {
+            p.abort();
+        }
+    }
 }
 
 /// Streaming `ask`: a manual handler (not `CommandDef::typed`) because the
@@ -343,8 +390,19 @@ impl CommandHandler for AskHandler {
             };
         }
         let (tx, rx) = futures::channel::mpsc::unbounded::<StreamRecord>();
-        tokio::spawn(async move {
+        // Consumer-lifetime: the pump runs chat_stream to completion;
+        // if the RecordStream is dropped, every unbounded_send fails,
+        // and incurs stops polling — but this task must not outlive
+        // its receiver. Guarded below by checking send results and
+        // ending the task (dropping the HTTP request cancels the turn
+        // server-side) as soon as the channel closes.
+        let pump = tokio::spawn(async move {
             let tx2 = tx.clone();
+            // The receiver is owned by the returned stream; a send
+            // failure means the consumer has gone. Tag the result so a
+            // wrapper can stop early if chat_stream ever gains deltas
+            // after closure — today the request is dropped when this
+            // task's future is dropped by the select in the caller.
             let result = client
                 .chat_stream(&req, move |delta| {
                     let _ = tx2.unbounded_send(StreamRecord::Chunk(Value::String(delta)));
@@ -375,7 +433,12 @@ impl CommandHandler for AskHandler {
             };
             let _ = tx.unbounded_send(terminal);
         });
-        let stream: Pin<Box<dyn futures::Stream<Item = StreamRecord> + Send>> = Box::pin(rx);
+        // (stream wiring is below, after the pump's terminal send)
+        let stream: Pin<Box<dyn futures::Stream<Item = StreamRecord> + Send>> =
+            Box::pin(AbortOnDrop {
+                inner: rx,
+                pump: Some(pump),
+            });
         CommandResult::RecordStream(stream)
     }
 }
@@ -575,6 +638,29 @@ struct KeysUpdateOptions {
 /// mc's boolean flags (incurs derives `bool` as a value-taking option).
 /// A bare following `true`/`false` is that flag's value, never prompt
 /// text; `normalize_argv` rewrites a flag with no value to `--flag true`.
+/// Insert an explicit `true` after any bool flag that lacks a value.
+/// A following bare `true`/`false` is kept as the value.
+fn expand_bool_flags(argv: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(argv.len() + 4);
+    let mut k = 0;
+    while k < argv.len() {
+        let t = argv[k].clone();
+        if t == "--" {
+            out.extend_from_slice(&argv[k..]);
+            break;
+        }
+        out.push(t.clone());
+        if is_bool_flag(&t) {
+            match argv.get(k + 1).map(String::as_str) {
+                Some("true") | Some("false") => {}
+                _ => out.push("true".to_string()),
+            }
+        }
+        k += 1;
+    }
+    out
+}
+
 fn is_bool_flag(token: &str) -> bool {
     matches!(
         token,
@@ -647,7 +733,28 @@ pub fn normalize_argv(argv: Vec<String>) -> Vec<String> {
         }
         break;
     }
+    // Boolean-flag expansion must run BEFORE the command position is
+    // computed: inserting `true` shifts every later index, and a stale
+    // cmd_at would merge the command name into the prompt.
+    let argv = expand_bool_flags(argv);
     let mut out = argv.clone();
+    // Recompute the command position on the expanded argv.
+    let mut i = 0;
+    while i < argv.len() {
+        let t = &argv[i];
+        if t == "--" {
+            break;
+        }
+        if VALUE_FLAGS.contains(&t.as_str()) || is_bool_flag(t) {
+            i += 2;
+            continue;
+        }
+        if t.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        break;
+    }
     // Bare prompt: first real token is no command — route the line to ask.
     if i >= argv.len() || !COMMANDS.contains(&argv[i].as_str()) {
         out.insert(i, "ask".to_string());
@@ -666,38 +773,6 @@ pub fn normalize_argv(argv: Vec<String>) -> Vec<String> {
     } else {
         None
     };
-    // Boolean flags: a bare `true`/`false` after one is its value, and a
-    // flag with no value gets `--flag true` appended — never prompt text.
-    // (incurs derives bool as a value-taking option; this is the fix at
-    // our boundary, applied before incurs parses.)
-    {
-        let mut k = 0;
-        while k < out.len() {
-            if out[k] == "--" {
-                break;
-            }
-            if is_bool_flag(&out[k]) {
-                match out.get(k + 1).map(String::as_str) {
-                    Some("true") | Some("false") => {
-                        k += 2;
-                        continue;
-                    }
-                    _ => {
-                        out.insert(k + 1, "true".to_string());
-                        k += 2;
-                        continue;
-                    }
-                }
-            }
-            if out[k].starts_with('-')
-                && out[k].contains('=')
-                && is_bool_flag(out[k].split('=').next().unwrap_or(""))
-            {
-                // --flag=true is already explicit; leave it.
-            }
-            k += 1;
-        }
-    }
     if let Some(start) = join_from {
         let mut pos: Vec<usize> = Vec::new();
         let mut j = start;
@@ -850,6 +925,17 @@ impl CommandHandler for BatchHandler {
             .get("file")
             .and_then(Value::as_str)
             .unwrap_or("-");
+        // stdin is only ever read for a real terminal invocation: on
+        // MCP/HTTP surfaces stdin is the protocol stream / server pipe.
+        if src == "-" && ctx.request.is_some() {
+            return CommandResult::Error {
+                code: "bad_input".into(),
+                message: "batch over MCP/HTTP needs --file <path> (stdin is the terminal's)".into(),
+                retryable: false,
+                exit_code: Some(2),
+                cta: None,
+            };
+        }
         let text = if src == "-" {
             use tokio::io::AsyncReadExt;
             let mut buf = String::new();
@@ -909,33 +995,40 @@ impl CommandHandler for BatchHandler {
             .unwrap_or(4)
             .clamp(1, 32) as usize;
         let items = batch_requests(&prompts, &ctx.options, &settings);
+        let total = items.len();
         let (tx, rx) = futures::channel::mpsc::unbounded::<StreamRecord>();
-        tokio::spawn(async move {
-            let results = client.chat_batch(items, concurrency).await;
-            let mut failed = 0usize;
-            for (i, item) in results.iter().enumerate() {
-                let rec = match &item.reply {
-                    Ok(r) => json!({
-                        "i": i, "prompt": item.prompt, "content": r.content,
-                        "session_id": r.session_id, "account": r.account,
-                    }),
-                    Err(e) => {
-                        failed += 1;
-                        json!({
-                            "i": i, "prompt": item.prompt,
-                            "error": { "code": e.code, "message": e.message },
-                        })
-                    }
-                };
-                let _ = tx.unbounded_send(StreamRecord::Chunk(rec));
-            }
+        let pump = tokio::spawn(async move {
+            // Stream each record as its item completes (carrying its
+            // input index for reassembly), then the summary + terminal.
+            let tx2 = tx.clone();
+            let failed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let failed2 = failed.clone();
+            client
+                .chat_batch_streaming(items, concurrency, move |item| {
+                    let rec = match &item.reply {
+                        Ok(r) => json!({
+                            "i": item.index, "prompt": item.prompt, "content": r.content,
+                            "session_id": r.session_id, "account": r.account,
+                        }),
+                        Err(e) => {
+                            failed2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            json!({
+                                "i": item.index, "prompt": item.prompt,
+                                "error": { "code": e.code, "message": e.message },
+                            })
+                        }
+                    };
+                    let _ = tx2.unbounded_send(StreamRecord::Chunk(rec));
+                })
+                .await;
+            let failed = failed.load(std::sync::atomic::Ordering::Relaxed);
             let _ = tx.unbounded_send(StreamRecord::Chunk(json!({
-                "done": true, "total": results.len(), "failed": failed,
+                "done": true, "total": total, "failed": failed,
             })));
             let terminal = if failed > 0 {
                 StreamRecord::Error {
                     code: "batch_failed".into(),
-                    message: format!("{failed} of {} batch item(s) failed", results.len()),
+                    message: format!("{failed} of {total} batch item(s) failed"),
                     retryable: true,
                     exit_code: Some(1),
                     cta: None,
@@ -945,7 +1038,14 @@ impl CommandHandler for BatchHandler {
             };
             let _ = tx.unbounded_send(terminal);
         });
-        let stream: Pin<Box<dyn futures::Stream<Item = StreamRecord> + Send>> = Box::pin(rx);
+        // Same consumer-lifetime rule as ask: dropping the stream
+        // aborts the batch pump (its in-flight HTTP requests drop,
+        // and the shim cancels those turns server-side).
+        let stream: Pin<Box<dyn futures::Stream<Item = StreamRecord> + Send>> =
+            Box::pin(AbortOnDrop {
+                inner: rx,
+                pump: Some(pump),
+            });
         CommandResult::RecordStream(stream)
     }
 }
@@ -967,16 +1067,32 @@ fn doctor_report(health: &Value, usage: Option<&Value>) -> Value {
             let paused = a.get("paused").and_then(Value::as_bool).unwrap_or(false);
             let in_pool = a.get("inPool").and_then(Value::as_bool).unwrap_or(false);
             let quota = a.get("quota").cloned().unwrap_or(Value::Null);
-            let depleted = quota
+            // Match the transport's own predicate (muse-transport
+            // `_noteQuota`): DEPLETED status, or 100% weekly with no
+            // purchased tokens left. 100% with topup remaining is
+            // still serviceable, not out_of_quota.
+            let topup = quota.get("topupBalance").and_then(Value::as_f64);
+            // Match the transport predicate exactly (muse-transport
+            // _noteQuota/_depleted): status covers DEPLETED|EXHAUSTED|
+            // EXCEEDED; the percentUsed arm requires a KNOWN balance
+            // (topup != null && topup <= 0) — absent balance is unknown,
+            // not depleted.
+            let status_out = quota
                 .get("status")
                 .and_then(Value::as_str)
-                .map(|s| s.eq_ignore_ascii_case("DEPLETED"))
-                .unwrap_or(false)
-                || quota
+                .map(|s| {
+                    s.eq_ignore_ascii_case("DEPLETED")
+                        || s.eq_ignore_ascii_case("EXHAUSTED")
+                        || s.eq_ignore_ascii_case("EXCEEDED")
+                })
+                .unwrap_or(false);
+            let depleted = status_out
+                || (quota
                     .get("percentUsed")
                     .and_then(Value::as_f64)
                     .map(|p| p >= 100.0)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    && topup.map(|b| b <= 0.0).unwrap_or(false));
             let verdict = if signed_out {
                 "signed_out"
             } else if vm_disabled {

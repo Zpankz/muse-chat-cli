@@ -717,8 +717,7 @@ async function handleChat(req, res, body) {
         if (r.error && !emitted) throw new Error(r.error)
       }
 
-      write(chunk(id, model, created, {}, finishReason))
-      write(chunk(id, model, created, {}, 'stop', r.sessionId ? { session_id: r.sessionId } : null))
+      write(chunk(id, model, created, {}, finishReason, r.sessionId ? { session_id: r.sessionId } : null))
       if (body.stream_options && body.stream_options.include_usage) {
         write(`data: ${JSON.stringify({
           id, object: 'chat.completion.chunk', created, model, choices: [],

@@ -86,7 +86,10 @@ fn find_server_dir() -> Option<PathBuf> {
             if dir.join("muse-server.mjs").exists() {
                 return Some(dir.to_path_buf());
             }
-            dir = dir.parent()?;
+            // Exhausting one root must not skip the next: an installed
+            // binary (~/.local/bin/mc) reaches `/` before the cwd walk.
+            let Some(parent) = dir.parent() else { break };
+            dir = parent;
         }
     }
     None

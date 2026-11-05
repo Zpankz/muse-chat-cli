@@ -30,8 +30,7 @@
   },
   "bin": {
     "muse-mcp": "muse-server.mjs",
-    "muse": "muse-cli.mjs",
-    "mc": "./target/release/mc"
+    "muse": "muse-cli.mjs"
   },
   "scripts": {
     "start": "node muse-server.mjs",

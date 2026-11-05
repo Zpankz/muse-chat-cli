@@ -81,6 +81,7 @@ pub struct ChatReply {
 /// or fails the others.
 #[derive(Debug)]
 pub struct BatchItemResult {
+    pub index: usize,
     pub prompt: String,
     pub reply: Result<ChatReply, ShimError>,
 }
@@ -132,8 +133,20 @@ impl ShimClient {
     }
 
     /// `GET /health` — transport / login state plus model ids.
+    ///
+    /// Carries its own short deadline: the client builder sets only a
+    /// connect timeout (chat turns legitimately run minutes), so without
+    /// this a shim that accepts the connection but never responds would
+    /// hang every command on the probe.
     pub async fn health(&self) -> Result<Value, ShimError> {
-        self.get_json("/health").await
+        let res = self
+            .http
+            .get(self.url("/health"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| ShimError::unreachable(&self.base, e))?;
+        parse_json_response(res).await
     }
 
     /// `GET /v1/models`.
@@ -421,8 +434,58 @@ impl ShimClient {
         .await
         .into_iter()
         .zip(prompts)
-        .map(|(reply, prompt)| BatchItemResult { prompt, reply })
+        .enumerate()
+        .map(|(index, (reply, prompt))| BatchItemResult {
+            index,
+            prompt,
+            reply,
+        })
         .collect()
+    }
+
+    /// Batch of non-streaming chats with completion-order delivery.
+    ///
+    /// Same semantics as [`chat_batch`](Self::chat_batch) — `chat()` per item
+    /// with at most `concurrency` requests in flight (clamped to 1..=32),
+    /// every item forced onto a fresh Muse thread, one item's failure
+    /// captured in its own slot — except results are NOT order-preserving:
+    /// `on_item` is called with each [`BatchItemResult`] as soon as that
+    /// item's underlying `chat()` completes. Each result carries its input
+    /// `index` so callers can reassemble order themselves.
+    pub async fn chat_batch_streaming<F: FnMut(BatchItemResult) + Send>(
+        &self,
+        items: Vec<ChatRequest>,
+        concurrency: usize,
+        mut on_item: F,
+    ) {
+        let limit = concurrency.clamp(1, 32);
+        let reqs: Vec<(usize, ChatRequest)> = items
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut r)| {
+                r.new_thread = true;
+                (index, r)
+            })
+            .collect();
+        let this = self.clone();
+        futures::stream::iter(reqs.into_iter().map(|(index, req)| {
+            let client = this.clone();
+            let prompt = req.prompt.clone();
+            async move {
+                let reply = client.chat(&req).await;
+                BatchItemResult {
+                    index,
+                    prompt,
+                    reply,
+                }
+            }
+        }))
+        .buffer_unordered(limit)
+        .for_each(|item| {
+            on_item(item);
+            futures::future::ready(())
+        })
+        .await;
     }
 
     /// Streaming chat over SSE. `on_delta` receives each incremental piece
@@ -446,17 +509,22 @@ impl ShimClient {
             return Err(error_from_body(status.as_u16(), &text));
         }
         let mut stream = res.bytes_stream();
-        let mut buf = String::new();
+        // Raw bytes: SSE line reassembly happens on bytes (split at b'\n')
+        // and only complete lines are decoded. Decoding each reqwest chunk
+        // separately would corrupt a multibyte char split across chunks.
+        let mut buf: Vec<u8> = Vec::new();
         let mut emitted = String::new();
         let mut account: Option<String> = None;
         let mut session_id: Option<String> = None;
         let mut tool_calls: Option<Value> = None;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| ShimError::new("stream_error", e.to_string(), true))?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line: String = buf.drain(..=pos).collect();
-                let line = line.trim();
+            buf.extend_from_slice(&chunk);
+            let (lines, rest) = split_sse_lines(&buf);
+            buf = rest;
+            for raw_line in lines {
+                // A full SSE line is valid UTF-8 in practice; lossy is a safe fallback.
+                let line = raw_line.trim();
                 if let Some(data) = line.strip_prefix("data:") {
                     let data = data.trim();
                     if data == "[DONE]" || data.is_empty() {
@@ -479,12 +547,17 @@ impl ShimClient {
                     if let Some(p) = v.get("muse_partial") {
                         let offset = p.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
                         let text = p.get("text").and_then(Value::as_str).unwrap_or("");
-                        let mut next: String = emitted.chars().take(offset).collect();
-                        // `offset` is a JS UTF-16 length; char-take is exact for ASCII and a safe
-                        // approximation otherwise — the final non-streamed body is authoritative.
-                        next.push_str(text);
-                        if next.len() > emitted.len() {
-                            on_delta(next[emitted.len()..].to_string());
+                        // `offset` is a JS UTF-16 code-unit length, not a Rust char or byte
+                        // index. Walk `emitted` and keep the largest char-boundary-safe prefix
+                        // whose UTF-16 length is <= offset; a retry restarting at a lower
+                        // offset truncates back to that prefix, never mid-char.
+                        let next = apply_partial(&emitted, offset, text);
+                        let emitted_chars = emitted.chars().count();
+                        let next_chars: Vec<char> = next.chars().collect();
+                        if next_chars.len() > emitted_chars
+                            && next_chars[..emitted_chars].iter().collect::<String>() == emitted
+                        {
+                            on_delta(next_chars[emitted_chars..].iter().collect());
                         }
                         emitted = next;
                         continue;
@@ -533,6 +606,45 @@ pub async fn shim_healthy(base: &str) -> bool {
         return false;
     };
     matches!(client.health().await, Ok(v) if health_ok(&v))
+}
+
+/// Rebuild the cumulative text for a streamed `muse_partial {offset, text}`
+/// event: keep `emitted`'s prefix up to `offset`, then append `text`.
+///
+/// `offset` is a JavaScript UTF-16 code-unit length, so it is converted to a
+/// char-boundary-safe prefix: the largest prefix of `emitted` whose UTF-16
+/// length is `<= offset`. Offsets landing mid-char (a surrogate pair, or any
+/// multi-unit char) truncate back to the char boundary instead of panicking
+/// or splitting bytes. ASCII behaviour is byte-identical to a char take.
+fn apply_partial(emitted: &str, offset_utf16: usize, text: &str) -> String {
+    let mut units = 0usize;
+    let mut end = 0usize;
+    for (i, c) in emitted.char_indices() {
+        let next_units = units + c.len_utf16();
+        if next_units > offset_utf16 {
+            break;
+        }
+        units = next_units;
+        end = i + c.len_utf8();
+    }
+    let mut next = String::with_capacity(end + text.len());
+    next.push_str(&emitted[..end]);
+    next.push_str(text);
+    next
+}
+
+/// Split raw SSE bytes into complete `\n`-terminated lines, decoding each
+/// only once whole. Returns the lines and any trailing partial bytes.
+fn split_sse_lines(buf: &[u8]) -> (Vec<String>, Vec<u8>) {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        if b == b'\n' {
+            lines.push(String::from_utf8_lossy(&buf[start..=i]).to_string());
+            start = i + 1;
+        }
+    }
+    (lines, buf[start..].to_vec())
 }
 
 fn session_id_from_value(v: &Value) -> Option<String> {
@@ -684,6 +796,43 @@ pub fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_partial_ascii_is_byte_identical() {
+        assert_eq!(apply_partial("", 0, "hello"), "hello");
+        assert_eq!(apply_partial("hello", 5, " world"), "hello world");
+        // Retry restarting at a lower offset truncates back.
+        assert_eq!(apply_partial("hello world", 5, "!"), "hello!");
+    }
+
+    #[test]
+    fn apply_partial_utf16_offset_never_splits_a_char() {
+        // "héllo": h=1, é=1, l=1, l=1, o=1 UTF-16 units (é is 1 unit in UTF-16).
+        assert_eq!(apply_partial("héllo", 1, "X"), "hX");
+        // "𝄞x": 𝄞 is 2 UTF-16 units (surrogate pair), x is 1.
+        // Offset 1 lands mid-surrogate-pair: truncate back to "" — must not panic.
+        assert_eq!(apply_partial("𝄞x", 1, "y"), "y");
+        assert_eq!(apply_partial("𝄞x", 2, "y"), "𝄞y");
+        assert_eq!(apply_partial("𝄞x", 3, "y"), "𝄞xy");
+        // Oversized offset keeps the whole prefix.
+        assert_eq!(apply_partial("héllo", 99, "!"), "héllo!");
+    }
+
+    #[test]
+    fn split_sse_lines_keeps_split_multibyte_chars_intact() {
+        // "é" (U+00E9) as bytes, chunked mid-char like a reqwest chunk boundary.
+        let line = "data: {\"t\":\"héllo\"}\n";
+        let bytes = line.as_bytes();
+        let e_pos = line.find('é').unwrap();
+        let (lines, rest) = split_sse_lines(&bytes[..e_pos + 1]);
+        assert!(lines.is_empty(), "partial line must not be emitted");
+        let mut buf = rest;
+        buf.extend_from_slice(&bytes[e_pos + 1..]);
+        let (lines, rest) = split_sse_lines(&buf);
+        assert!(rest.is_empty());
+        assert_eq!(lines, vec![line.to_string()]);
+        assert!(lines[0].contains('é'), "no replacement chars");
+    }
 
     #[test]
     fn urlencode_escapes() {
@@ -912,5 +1061,114 @@ mod tests {
             seen_new_thread.lock().unwrap().as_slice(),
             &[true, true, true]
         );
+    }
+
+    /// `chat_batch_streaming` delivers in completion order: with concurrency 2
+    /// and a slow first item, the fast second item's result must reach
+    /// `on_item` before the slow one completes. The stub sleeps 150ms only
+    /// for the `"slow"` prompt and replies immediately otherwise.
+    #[tokio::test]
+    async fn chat_batch_streaming_delivers_in_completion_order() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let head_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                assert!(n > 0, "client closed mid-request");
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let mut len = 0usize;
+            for line in headers.lines().skip(1) {
+                let l = line.trim().to_lowercase();
+                if let Some(n) = l.strip_prefix("content-length:") {
+                    len = n.trim().parse().unwrap_or(0);
+                }
+            }
+            while buf.len() < head_end + len {
+                let n = sock.read(&mut tmp).await.unwrap();
+                assert!(n > 0, "client closed mid-body");
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let v: Value = serde_json::from_slice(&buf[head_end..head_end + len]).unwrap();
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|m| m["role"] == "user")
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or("")
+                .to_string()
+        }
+
+        async fn write_completion(sock: &mut tokio::net::TcpStream, prompt: &str) {
+            let body = serde_json::to_string(&json!({
+                "id": "chatcmpl-stub",
+                "object": "chat.completion",
+                "model": "stub",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": format!("echo:{prompt}")}, "finish_reason": "stop"}],
+                "session_id": format!("sess-{prompt}"),
+            }))
+            .unwrap();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Two batch items below => exactly two POSTs, each on its own connection.
+        let server = tokio::spawn(async move {
+            let (mut slow_sock, _) = listener.accept().await.unwrap();
+            let (mut fast_sock, _) = listener.accept().await.unwrap();
+            // reqwest opens connections in request order: items are
+            // ["slow", "fast"], so the first accept is "slow". Read both
+            // requests first (no delays yet), then answer fast immediately
+            // while slow waits out its 150ms artificial delay.
+            let slow_prompt = read_request(&mut slow_sock).await;
+            let fast_prompt = read_request(&mut fast_sock).await;
+            assert_eq!(slow_prompt, "slow");
+            assert_eq!(fast_prompt, "fast");
+            write_completion(&mut fast_sock, &fast_prompt).await;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            write_completion(&mut slow_sock, &slow_prompt).await;
+        });
+
+        let client = ShimClient::new(&format!("http://127.0.0.1:{port}")).unwrap();
+        let mk = |prompt: &str| ChatRequest {
+            prompt: prompt.to_string(),
+            model: "stub".to_string(),
+            timeout_ms: 5_000,
+            ..Default::default() // new_thread: false on purpose — batch must force it
+        };
+        let delivered: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = delivered.clone();
+        client
+            .chat_batch_streaming(vec![mk("slow"), mk("fast")], 2, move |item| {
+                // Prompts preserved per slot alongside the new index.
+                assert_eq!(item.prompt, if item.index == 0 { "slow" } else { "fast" });
+                let ok = item.reply.as_ref().expect("both items must succeed");
+                assert_eq!(ok.content, format!("echo:{}", item.prompt));
+                seen.lock().unwrap().push(item.index);
+            })
+            .await;
+        server.await.unwrap();
+
+        let order = delivered.lock().unwrap().clone();
+        assert_eq!(order.len(), 2, "both items must be delivered");
+        assert_eq!(
+            order[0], 1,
+            "fast item (index 1) must be delivered before slow item (index 0): {order:?}"
+        );
+        assert!(order.contains(&0) && order.contains(&1));
     }
 }
