@@ -360,6 +360,13 @@ impl ShimClient {
             "messages": messages,
             "stream": stream,
         });
+        if stream {
+            // Without include_usage the shim emits the selected account
+            // only in a usage chunk it never sends, so a streamed reply
+            // would report account: null and the caller could not pin
+            // the continuation to the account owning the thread.
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         if !req.files.is_empty() {
             body["files"] = json!(req.files);
         }
@@ -615,19 +622,14 @@ impl ShimClient {
 }
 
 /// Health probe used by autostart: true only when `/health` looks like our
-/// shim (`ok: true`, a `models` array, or a `transport` field) — a foreign
-/// service answering JSON on the same port must not count as healthy.
+/// shim. The shim answers unauthenticated non-local probes with a bare
+/// `{ok: true}` and so do countless foreign services, so `ok` alone proves
+/// nothing: require the identifying fields the authenticated/local health
+/// body always carries (a `models` array plus a boolean `browserRunning`).
 pub fn health_ok(v: &Value) -> bool {
-    if v.get("ok").and_then(Value::as_bool) == Some(true) {
-        return true;
-    }
-    if v.get("models").and_then(Value::as_array).is_some() {
-        return true;
-    }
-    if v.get("transport").is_some() {
-        return true;
-    }
-    false
+    v.get("ok").and_then(Value::as_bool) == Some(true)
+        && v.get("models").and_then(Value::as_array).is_some()
+        && v.get("browserRunning").and_then(Value::as_bool).is_some()
 }
 
 pub async fn shim_healthy(base: &str) -> bool {
@@ -915,10 +917,21 @@ mod tests {
 
     #[test]
     fn health_ok_shapes() {
-        assert!(health_ok(&json!({"ok": true})));
-        assert!(health_ok(&json!({"models": []})));
-        assert!(health_ok(&json!({"transport": "noise"})));
-        assert!(!health_ok(&json!({"ok": false})));
+        // The full local/authenticated shim health body is healthy.
+        assert!(health_ok(
+            &json!({"ok": true, "models": [], "browserRunning": false})
+        ));
+        assert!(health_ok(
+            &json!({"ok": true, "models": ["muse"], "browserRunning": true, "transport": "noise"})
+        ));
+        // The shim's own unauthenticated shape, and foreign lookalikes, are not.
+        assert!(!health_ok(&json!({"ok": true})));
+        assert!(!health_ok(&json!({"models": []})));
+        assert!(!health_ok(&json!({"transport": "noise"})));
+        assert!(!health_ok(&json!({"ok": true, "models": []})));
+        assert!(!health_ok(
+            &json!({"ok": false, "models": [], "browserRunning": true})
+        ));
         assert!(!health_ok(&json!({"status": "up"})));
         assert!(!health_ok(&json!({})));
     }

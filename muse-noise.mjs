@@ -729,8 +729,9 @@ export class MuseNoiseClient {
       })
     })
   }
-  async chatHistory(max = 50) {
-    const r = await this.request('GET', `/chat/history?limit=${max}`)
+  async chatHistory(max = 50, sessionId = null) {
+    const sid = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ''
+    const r = await this.request('GET', `/chat/history?limit=${max}${sid}`)
     let json = null
     try { json = JSON.parse(r.body.toString('utf8')) } catch {}
     return { status: r.status, json, raw: r.body.toString('utf8').slice(0, 4000) }

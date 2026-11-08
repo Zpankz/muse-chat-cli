@@ -851,8 +851,14 @@ export function startShim({ port = PORT, host = HOST, exitOnError = false } = {}
         const params = new URL(req.url, 'http://localhost').searchParams
         const target = params.get('target')
         const acct = params.get('account') || undefined
-        if (target) await transport.openChat(/^\d+$/.test(target) ? Number(target) : target, { account: acct })
-        const data = await transport.readChat(Number(params.get('max')) || 100, { account: acct })
+        // Browser: openChat selects the chat, then readChat reads it (an
+        // unknown target throws → 500). Noise resolves the target inside
+        // readChat and throws on a miss; calling openChat there would
+        // discard its {ok:false} and silently read the active session.
+        if (target && typeof transport.openChat === 'function' && transport.transportKind !== 'noise') {
+          await transport.openChat(/^\d+$/.test(target) ? Number(target) : target, { account: acct })
+        }
+        const data = await transport.readChat(Number(params.get('max')) || 100, { account: acct, ...(target ? { target } : {}) })
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
         return res.end(JSON.stringify(data))
       }

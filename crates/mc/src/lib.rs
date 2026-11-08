@@ -193,11 +193,12 @@ struct AskOptions {
 fn load_schema(raw: &str) -> Result<Value, String> {
     let t = raw.trim();
     if t.starts_with('{') {
-        return serde_json::from_str(t).map_err(|e| format!("--schema: invalid inline JSON: {e}"));
+        return serde_json::from_str(t)
+            .map_err(|e| format!("--json-schema: invalid inline JSON: {e}"));
     }
-    let text =
-        std::fs::read_to_string(raw).map_err(|e| format!("--schema: cannot read {raw}: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("--schema: invalid JSON in {raw}: {e}"))
+    let text = std::fs::read_to_string(raw)
+        .map_err(|e| format!("--json-schema: cannot read {raw}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("--json-schema: invalid JSON in {raw}: {e}"))
 }
 
 fn ask_request(ctx: &CommandContext, prompt: String) -> Result<ChatRequest, String> {
@@ -263,7 +264,7 @@ fn resolve_prompt(positional: String, stdin: Option<String>) -> Result<String, B
             cta: None,
         }));
     }
-    Ok(prompt.trim().to_string())
+    Ok(prompt)
 }
 
 /// A RecordStream that aborts its pump task when dropped: dropping
@@ -331,7 +332,7 @@ impl CommandHandler for AskHandler {
             Ok(p) => p,
             Err(r) => return *r,
         };
-        let req = match ask_request(&ctx, prompt.trim().to_string()) {
+        let req = match ask_request(&ctx, prompt) {
             Ok(r) => r,
             Err(m) => {
                 return CommandResult::Error {
@@ -355,12 +356,17 @@ impl CommandHandler for AskHandler {
                 }
             }
         };
+        // JSON/agent callers need the single {content, session_id, …}
+        // envelope, not a delta stream: only a human text/jsonl surface
+        // streams. (`mc --json ask` must be one parseable result.)
         let streaming = !ctx
             .options
             .get("no_stream")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-            && req.json_schema.is_none();
+            && req.json_schema.is_none()
+            && ctx.format != Format::Json
+            && !ctx.agent;
         if !streaming {
             return match client.chat(&req).await {
                 Ok(reply) => {
@@ -510,8 +516,20 @@ fn ask_command(root: bool) -> incurs::command::CommandDef {
         .examples(examples)
         .done();
     cmd.output_schema = Some(json!({
-        "type": "string",
-        "description": "The assistant reply text, streamed as deltas. With --schema, the schema-valid JSON value instead."
+        "description": "Human text: the reply text (streamed as string deltas). JSON/agent callers: one object {content, session_id, account, model}. With --json-schema: the schema-valid JSON value instead.",
+        "anyOf": [
+            { "type": "string" },
+            {
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string" },
+                    "session_id": { "type": ["string", "null"] },
+                    "account": { "type": ["string", "null"] },
+                    "model": { "type": "string" }
+                },
+                "required": ["content", "session_id", "account", "model"]
+            }
+        ]
     }));
     cmd
 }
@@ -971,8 +989,8 @@ impl CommandHandler for BatchHandler {
             // Stream each record as its item completes (carrying its
             // input index for reassembly), then the summary + terminal.
             let tx2 = tx.clone();
-            let failed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let failed2 = failed.clone();
+            let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+            let failures2 = failures.clone();
             client
                 .chat_batch_streaming(items, concurrency, move |item| {
                     let rec = match &item.reply {
@@ -981,17 +999,25 @@ impl CommandHandler for BatchHandler {
                             "session_id": r.session_id, "account": r.account,
                         }),
                         Err(e) => {
-                            failed2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            failures2
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .push(e.retryable);
                             json!({
                                 "i": item.index, "prompt": item.prompt,
-                                "error": { "code": e.code, "message": e.message },
+                                "error": { "code": e.code, "message": e.message, "retryable": e.retryable },
                             })
                         }
                     };
                     let _ = tx2.unbounded_send(StreamRecord::Chunk(rec));
                 })
                 .await;
-            let failed = failed.load(std::sync::atomic::Ordering::Relaxed);
+            // Aggregate retryability comes from the item errors: a batch
+            // is safe to retry only when every failure is retryable —
+            // retrying it repeats the successful turns too.
+            let item_retryable = failures.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let failed = item_retryable.len();
+            let batch_retryable = failed > 0 && item_retryable.iter().all(|r| *r);
             let _ = tx.unbounded_send(StreamRecord::Chunk(json!({
                 "done": true, "total": total, "failed": failed,
             })));
@@ -999,7 +1025,7 @@ impl CommandHandler for BatchHandler {
                 StreamRecord::Error {
                     code: "batch_failed".into(),
                     message: format!("{failed} of {total} batch item(s) failed"),
-                    retryable: true,
+                    retryable: batch_retryable,
                     exit_code: Some(1),
                     cta: None,
                 }
@@ -1036,6 +1062,11 @@ fn doctor_report(health: &Value, usage: Option<&Value>, selected: Option<&str>) 
             let vm_disabled = !a.get("vmDisabled").map(|v| v.is_null()).unwrap_or(true);
             let paused = a.get("paused").and_then(Value::as_bool).unwrap_or(false);
             let in_pool = a.get("inPool").and_then(Value::as_bool).unwrap_or(false);
+            // inPool ignores authentication: an account with no cookies
+            // (or no live connection) cannot serve a turn, so it must
+            // not read as ready.
+            let logged_in = a.get("loggedIn").and_then(Value::as_bool).unwrap_or(false);
+            let connected = a.get("connected").and_then(Value::as_bool).unwrap_or(false);
             let quota = a.get("quota").cloned().unwrap_or(Value::Null);
             // Match the transport's own predicate (muse-transport
             // `_noteQuota`): DEPLETED status, or 100% weekly with no
@@ -1071,7 +1102,7 @@ fn doctor_report(health: &Value, usage: Option<&Value>, selected: Option<&str>) 
                 "paused"
             } else if depleted {
                 "out_of_quota"
-            } else if in_pool {
+            } else if in_pool && logged_in && connected {
                 "ready"
             } else {
                 "not_ready"
@@ -1327,8 +1358,11 @@ pub fn build_cli() -> Cli {
                 Ok(c) => match c.health().await {
                     Ok(h) => {
                         let usage = c.usage(ctx.options.account.as_deref()).await.ok();
-                        // `base` is not part of the shim body; add ours.
-                        let mut health = h;
+                        // The usage probe refreshes quota/pool state in
+                        // the transport (_noteQuota/_expire); re-read
+                        // health so verdicts use the fresh snapshot,
+                        // not the one taken before the probe.
+                        let mut health = c.health().await.unwrap_or(h);
                         if let Some(o) = health.as_object_mut() {
                             o.insert(
                                 "base".into(),
@@ -1481,7 +1515,7 @@ pub fn build_cli() -> Cli {
             }
         },
     )
-    .description("Start a fresh Muse thread")
+    .description("Start a fresh Muse thread (noise: mints a session_id that materializes on first send; continue with `ask --chat <session_id>`)")
     .done();
 
     let last = CommandDef::typed::<(), AccountOptions, (), Value, _, _>(
@@ -1715,12 +1749,50 @@ mod argv_tests {
     }
 
     #[test]
+    fn prompt_is_preserved_verbatim() {
+        let ok = |r: Result<String, Box<super::CommandResult>>| r.ok();
+        assert_eq!(
+            ok(super::resolve_prompt("  padded prompt\n".to_string(), None)),
+            Some("  padded prompt\n".to_string())
+        );
+        assert_eq!(
+            ok(super::resolve_prompt(
+                String::new(),
+                Some("  piped\n".to_string())
+            )),
+            Some("  piped\n".to_string())
+        );
+        assert!(super::resolve_prompt("  ".to_string(), None).is_err());
+    }
+
+    #[test]
+    fn json_schema_errors_name_the_json_schema_option() {
+        let err = super::load_schema("{not json").unwrap_err();
+        assert!(err.contains("--json-schema"), "{err}");
+        let err = super::load_schema("/nonexistent/schema.json").unwrap_err();
+        assert!(err.contains("--json-schema"), "{err}");
+    }
+
+    #[test]
+    fn doctor_requires_authentication_for_ready() {
+        let health = json!({
+            "transport": "noise",
+            "accounts": [
+                {"id": "a", "inPool": true, "loggedIn": false, "connected": false}
+            ]
+        });
+        let report = doctor_report(&health, None, None);
+        assert_eq!(report["accounts"][0]["verdict"], "not_ready");
+        assert_eq!(report["verdict"], "not_ready");
+    }
+
+    #[test]
     fn doctor_does_not_borrow_another_accounts_readiness() {
         let health = json!({
             "transport": "noise",
             "accounts": [
                 {"id": "a", "inPool": false, "signedOut": {"reason": "expired"}},
-                {"id": "b", "inPool": true}
+                {"id": "b", "inPool": true, "loggedIn": true, "connected": true}
             ]
         });
         assert_eq!(doctor_report(&health, None, None)["verdict"], "ready");
@@ -1748,7 +1820,7 @@ mod argv_tests {
         ] {
             let health = json!({
                 "transport": "noise",
-                "accounts": [{"id": "a", "inPool": true, "quota": quota}]
+                "accounts": [{"id": "a", "inPool": true, "loggedIn": true, "connected": true, "quota": quota}]
             });
             assert_eq!(doctor_report(&health, None, Some("a"))["verdict"], expected);
         }
