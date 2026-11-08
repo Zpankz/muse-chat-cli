@@ -915,7 +915,7 @@ export class MuseNoiseClient {
   }
   async _chatOnce(prompt, opts = {}) {
     if (this.closing) throw abortedError() // shutting down: do not start a turn cancelAll() would miss
-    const sid = opts.newSession ? crypto.randomUUID() : (opts.sessionId || null)
+    const sid = opts.sessionId || (opts.newSession ? crypto.randomUUID() : null)
     const key = sid || ''
     this.sessions.add(key)
     try { return await this._chatTurn(prompt, { ...opts, sid }) } finally { this.sessions.delete(key) }

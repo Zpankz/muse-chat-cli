@@ -528,6 +528,9 @@ fn ask_command(root: bool) -> incurs::command::CommandDef {
                     "model": { "type": "string" }
                 },
                 "required": ["content", "session_id", "account", "model"]
+            },
+            {
+                "description": "With --json-schema, the caller-supplied schema determines the result: any JSON value is possible."
             }
         ]
     }));
@@ -1062,11 +1065,9 @@ fn doctor_report(health: &Value, usage: Option<&Value>, selected: Option<&str>) 
             let vm_disabled = !a.get("vmDisabled").map(|v| v.is_null()).unwrap_or(true);
             let paused = a.get("paused").and_then(Value::as_bool).unwrap_or(false);
             let in_pool = a.get("inPool").and_then(Value::as_bool).unwrap_or(false);
-            // inPool ignores authentication: an account with no cookies
-            // (or no live connection) cannot serve a turn, so it must
-            // not read as ready.
+            // inPool ignores authentication. Require cookies, but not
+            // a live socket: authenticated accounts connect on demand.
             let logged_in = a.get("loggedIn").and_then(Value::as_bool).unwrap_or(false);
-            let connected = a.get("connected").and_then(Value::as_bool).unwrap_or(false);
             let quota = a.get("quota").cloned().unwrap_or(Value::Null);
             // Match the transport's own predicate (muse-transport
             // `_noteQuota`): DEPLETED status, or 100% weekly with no
@@ -1102,7 +1103,7 @@ fn doctor_report(health: &Value, usage: Option<&Value>, selected: Option<&str>) 
                 "paused"
             } else if depleted {
                 "out_of_quota"
-            } else if in_pool && logged_in && connected {
+            } else if in_pool && logged_in {
                 "ready"
             } else {
                 "not_ready"
@@ -1515,7 +1516,7 @@ pub fn build_cli() -> Cli {
             }
         },
     )
-    .description("Start a fresh Muse thread (noise: mints a session_id that materializes on first send; continue with `ask --chat <session_id>`)")
+    .description("Start a fresh Muse thread (noise: reserves a session_id until server restart; first send creates it via `ask --chat <session_id> --account <account>`)")
     .done();
 
     let last = CommandDef::typed::<(), AccountOptions, (), Value, _, _>(
@@ -1784,6 +1785,17 @@ mod argv_tests {
         let report = doctor_report(&health, None, None);
         assert_eq!(report["accounts"][0]["verdict"], "not_ready");
         assert_eq!(report["verdict"], "not_ready");
+    }
+
+    #[test]
+    fn doctor_accepts_authenticated_accounts_that_connect_on_demand() {
+        let health = json!({
+            "transport": "noise",
+            "accounts": [
+                {"id": "a", "inPool": true, "loggedIn": true, "connected": false}
+            ]
+        });
+        assert_eq!(doctor_report(&health, None, None)["verdict"], "ready");
     }
 
     #[test]

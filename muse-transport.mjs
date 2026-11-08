@@ -497,7 +497,12 @@ class NoiseTransport {
   // Noise threads are client-chosen UUIDs that materialize on first send:
   // mint the id here so the caller can continue it with --chat <session_id>
   // (a bare "started" note would leave the next ask on the shared session).
-  async newChat(opts = {}) { const a = this._acct(opts.account); const sessionId = globalThis.crypto.randomUUID(); return { ok: true, transport: 'noise', account: a.id, session_id: sessionId, note: 'fresh thread id minted; it materializes on the first send — continue it with --chat <session_id>' } }
+  async newChat(opts = {}) {
+    const a = this._acct(opts.account)
+    const sessionId = globalThis.crypto.randomUUID()
+    ;(a.pendingSessions ??= new Set()).add(sessionId)
+    return { ok: true, transport: 'noise', account: a.id, session_id: sessionId, note: 'fresh thread id reserved until server restart; first send creates it — use --chat <session_id> --account <account>' }
+  }
   // Upload every file of the turn or fail: a turn that went out with fewer images than asked still came back 200 and
   // schema-valid (Muse just answers about what it got), so a lost image was invisible to the caller. A failure on a
   // live connection (VM `fs.write 502`, 60 s timeout) is retried in place — the connection carries the account's other
@@ -606,11 +611,13 @@ class NoiseTransport {
         }
         attachments = await this._uploadAll(client, files, signal) // fresh copies each attempt: the VM may have restarted
         let committed = ''
+        const sessionId = opts.sessionId || opts.chat || null
+        const pendingSession = a.pendingSessions?.has(sessionId) || false
         const r = await client.chat(prompt, {
           timeoutMs: opts.timeoutMs || Number(process.env.MUSE_STALL_IDLE_MS || 120000), // idle gap between events (activity-based; see _chatOnce)
           attachments,
-          newSession: !!(opts.newSession || opts.newThread),
-          sessionId: opts.sessionId || opts.chat || null,
+          newSession: pendingSession || !!(opts.newSession || opts.newThread),
+          sessionId,
           signal,
           onEvent: (ev) => {
             if (!onDelta) return
@@ -620,6 +627,7 @@ class NoiseTransport {
             }
           },
         })
+        if (pendingSession) a.pendingSessions.delete(sessionId)
         return {
           reply: r.reply,
           messages: r.reply ? [r.reply] : [],
