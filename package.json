@@ -35,6 +35,9 @@
   "scripts": {
     "start": "node muse-server.mjs",
     "muse": "node muse-cli.mjs",
+    "mc": "cargo run --release -p mc --",
+    "mc:build": "cargo build --release -p mc",
+    "mc:test": "cargo test -p mc",
     "selftest": "node muse-server.mjs --self-test",
     "dump": "node muse-server.mjs --dump-dom"
   },

@@ -719,10 +719,15 @@ export class MuseDriver {
       try { onDelta(reply) } catch { /* ignore */ }
     }
 
+    const threadUrl = p.url()
+    // The thread uuid in the URL is the session id (same id the noise
+    // transport returns as `sessionId`); the primary chat has none.
+    const sessionId = (threadUrl.match(/\/thread\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i) || [])[1] || null
     return {
       reply,
       messages: items,
-      threadUrl: p.url(),
+      threadUrl,
+      ...(sessionId ? { sessionId } : {}),
       elapsedMs: Date.now() - t0,
       ...(this.lastError ? { error: this.lastError } : {}),
       ...(timedOut ? { timedOut: true } : {}),

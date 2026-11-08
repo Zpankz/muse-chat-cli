@@ -11,7 +11,7 @@ That gives you two front doors:
 | **MCP server** (stdio) | 12 tools: `muse_status`, `muse_login`, `muse_new_chat`, `muse_chat`, `muse_read_last`, `muse_chats`, `muse_open_chat`, `muse_read_chat`, `muse_media`, `muse_usage`, `muse_dump_dom`, `muse_close` | Claude Desktop, opencode, Cursor, any MCP host |
 | **OpenAI-compatible shim** (HTTP) | `GET /v1/models`, `POST /v1/chat/completions` (stream + non-stream, tool calling) | any OpenAI SDK / `@ai-sdk/openai-compatible` provider |
 
-Plus a tiny **CLI** (`muse-cli.mjs`) for one-shot generation from scripts.
+Plus **`mc`** — a state-of-the-art Rust CLI built on the [incurs](https://github.com/Zpankz/incurs) framework: one typed command graph over the shim, exposed simultaneously as a terminal CLI, an MCP server, an HTTP + OpenAPI surface, agent manifests (`--llms`), shell completions, and Agent Skills. (`muse-cli.mjs` remains as the legacy Node CLI.)
 
 > [!IMPORTANT]
 > This drives **your** browser and **your** Muse account. It ships with **no** credentials, no Chrome profile, and no captured traffic — you sign in to your own Meta account on first run. See [Disclaimer](#disclaimer).
@@ -366,7 +366,30 @@ for chunk in r:
 
 ---
 
-## Use the CLI
+## Use the CLI — `mc` (Rust / incurs)
+
+`mc` is the primary CLI. It talks to the same OpenAI shim — reusing a running one, or auto-starting `muse-server.mjs --serve-only` detached (disable with `MC_NO_AUTOSTART=1`). The Node server still owns the browser/Noise transports, accounts and quota; `mc` is the typed front-end.
+
+```bash
+cargo build --release -p mc        # or: pnpm mc:build   → target/release/mc
+mc hello world                     # bare prompt = `mc ask "hello world"` (streams)
+mc ask -s "Output ONLY raw code" --no-stream "Write a quicksort"
+mc ask -f ./frame.png "Caption this image"          # -f repeatable
+mc ask --new-thread "Solve 2x^2 - 5x + 3 = 0"       # fresh side thread
+mc --json ask --json-schema ./schema.json "Extract name and age"  # schema-valid JSON
+mc status                          # shim / login / account-pool state
+mc usage                           # plan + weekly usage / tokens
+mc chats list --query video        # filter chats
+mc chats read "Video creation"     # read a chat without sending
+mc chats media --download --dir ./out
+mc http --addr 127.0.0.1:8788      # every command over HTTP, MCP at /mcp, /openapi.json
+mc --mcp                           # the same graph as an MCP stdio server
+echo "Review this" | mc ask -s "You are a code reviewer"
+```
+
+Because the graph is defined once with incurs, you also get `mc --llms` / `--llms-full` (agent manifest), `mc <cmd> --schema`, `mc completions bash|zsh|fish`, `mc skills add`, `mc plugin build`, `--format json|yaml|toon|jsonl|md`, and a config file (`mc.config.json`, see `mc --config-schema` and `crates/mc/examples/mc.config.json`). Errors are stable codes — notably `not_ready` when the browser transport has no warmed-up composer yet (run `mc status`, finish sign-in, retry; or use `MUSE_TRANSPORT=noise`). Verified against the Hatch iOS app: the native client uses this same Noise API — see [`docs/hatch-ios-api.md`](docs/hatch-ios-api.md).
+
+### Legacy Node CLI
 
 `muse-cli.mjs` talks to the OpenAI shim — it reuses a running one, or auto-starts `muse-server.mjs --serve-only` and shuts it down after (disable with `MUSE_CLI_AUTOSTART=0`). Prepend `MUSE_TRANSPORT=noise` to run **headless** (no browser).
 

@@ -170,6 +170,7 @@ const sessionExpired = (e) => SESSION_EXPIRED_RE.test((e && e.message) || String
 const hasLoginCreds = (c) => !!(c.email && (c.metaPassword || c.mailPassword || c.apiKey || c.mailToken || /generator\.email|luuvan\.site|tuan89\.site/i.test(c.otpUrl || '')))
 
 class NoiseTransport {
+  transportKind = 'noise'
   constructor() {
     this.accounts = new Map() // id -> { id, profileDir, cookies, client, viewerId, connecting, q, inflight, downUntil }
     this.order = []
@@ -493,7 +494,15 @@ class NoiseTransport {
     if (h.status === 200 && a.expired) { log(`session: ${a.id} signed in by hand — back in the pool`); a.expired = null }
     return { account: a.id, loggedIn: h.status === 200, transport: 'noise', viewerId: a.viewerId }
   }
-  async newChat(opts = {}) { const a = this._acct(opts.account); return { ok: true, transport: 'noise', account: a.id, note: 'over noise a new side chat is created per request via new_thread/newSession (the thread materializes on first send)' } }
+  // Noise threads are client-chosen UUIDs that materialize on first send:
+  // mint the id here so the caller can continue it with --chat <session_id>
+  // (a bare "started" note would leave the next ask on the shared session).
+  async newChat(opts = {}) {
+    const a = this._acct(opts.account)
+    const sessionId = globalThis.crypto.randomUUID()
+    ;(a.pendingSessions ??= new Set()).add(sessionId)
+    return { ok: true, transport: 'noise', account: a.id, session_id: sessionId, note: 'fresh thread id reserved until server restart; first send creates it — use --chat <session_id> --account <account>' }
+  }
   // Upload every file of the turn or fail: a turn that went out with fewer images than asked still came back 200 and
   // schema-valid (Muse just answers about what it got), so a lost image was invisible to the caller. A failure on a
   // live connection (VM `fs.write 502`, 60 s timeout) is retried in place — the connection carries the account's other
@@ -602,11 +611,13 @@ class NoiseTransport {
         }
         attachments = await this._uploadAll(client, files, signal) // fresh copies each attempt: the VM may have restarted
         let committed = ''
+        const sessionId = opts.sessionId || opts.chat || null
+        const pendingSession = a.pendingSessions?.has(sessionId) || false
         const r = await client.chat(prompt, {
           timeoutMs: opts.timeoutMs || Number(process.env.MUSE_STALL_IDLE_MS || 120000), // idle gap between events (activity-based; see _chatOnce)
           attachments,
-          newSession: !!(opts.newSession || opts.newThread),
-          sessionId: opts.sessionId || opts.chat || null,
+          newSession: pendingSession || !!(opts.newSession || opts.newThread),
+          sessionId,
           signal,
           onEvent: (ev) => {
             if (!onDelta) return
@@ -616,6 +627,7 @@ class NoiseTransport {
             }
           },
         })
+        if (pendingSession) a.pendingSessions.delete(sessionId)
         return {
           reply: r.reply,
           messages: r.reply ? [r.reply] : [],
@@ -799,11 +811,25 @@ class NoiseTransport {
   }
   async readChat(max = 100, opts = {}) {
     const a = this._acct(opts.account)
-    const h = await (await this._ensure(a)).chatHistory(max)
+    const sessionId = await this._sessionForTarget(opts.target, a)
+    const h = await (await this._ensure(a)).chatHistory(max, sessionId || undefined)
+    if (h.status === 404) throw new Error(`no chat matching "${opts.target}"`)
     const evs = (h.json && h.json.result && h.json.result.chat_events) || []
     const msgs = historyMessages(h.json)
     const media = extractMedia(evs)
-    return { messages: msgs.map((m) => m.text), entries: msgs.length, media, transport: 'noise', account: a.id }
+    return { messages: msgs.map((m) => m.text), entries: msgs.length, media, transport: 'noise', account: a.id, ...(sessionId ? { session_id: sessionId } : {}) }
+  }
+  // Resolve a chat target (session uuid / list index / title substring) to a
+  // session_id via the session list; no target = the primary session. Throws
+  // on an unmatched target instead of silently reading the active session.
+  async _sessionForTarget(target, a = this._acct()) {
+    if (target === null || target === undefined || target === '') return null
+    const s = String(target).trim()
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return s
+    const { chats } = await this.listChats(undefined, { account: a.id })
+    const chat = /^(\d+)$/.test(s) ? chats[Number(s)] : chats.find((c) => c.title.toLowerCase().includes(s.toLowerCase()))
+    if (!chat || !chat.session_id) throw new Error(`no chat matching "${s}"`)
+    return chat.session_id
   }
   async listChats(query, opts = {}) {
     const a = this._acct(opts.account)
@@ -825,7 +851,9 @@ class NoiseTransport {
   async chatMedia(chat, { download = false, dir, account } = {}) {
     const a = this._acct(account)
     const client = await this._ensure(a)
-    const h = await client.chatHistory(100)
+    const sessionId = await this._sessionForTarget(chat, a)
+    const h = await client.chatHistory(100, sessionId || undefined)
+    if (h.status === 404) throw new Error(`no chat matching "${chat}"`)
     const evs = (h.json && h.json.result && h.json.result.chat_events) || []
     const media = extractMedia(evs)
     const items = media.map((m, index) => ({ index, role: '', text: m.label, urls: [m.uri] }))

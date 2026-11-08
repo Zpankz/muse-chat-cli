@@ -729,8 +729,9 @@ export class MuseNoiseClient {
       })
     })
   }
-  async chatHistory(max = 50) {
-    const r = await this.request('GET', `/chat/history?limit=${max}`)
+  async chatHistory(max = 50, sessionId = null) {
+    const sid = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ''
+    const r = await this.request('GET', `/chat/history?limit=${max}${sid}`)
     let json = null
     try { json = JSON.parse(r.body.toString('utf8')) } catch {}
     return { status: r.status, json, raw: r.body.toString('utf8').slice(0, 4000) }
@@ -914,7 +915,7 @@ export class MuseNoiseClient {
   }
   async _chatOnce(prompt, opts = {}) {
     if (this.closing) throw abortedError() // shutting down: do not start a turn cancelAll() would miss
-    const sid = opts.newSession ? crypto.randomUUID() : (opts.sessionId || null)
+    const sid = opts.sessionId || (opts.newSession ? crypto.randomUUID() : null)
     const key = sid || ''
     this.sessions.add(key)
     try { return await this._chatTurn(prompt, { ...opts, sid }) } finally { this.sessions.delete(key) }

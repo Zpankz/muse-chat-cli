@@ -1,0 +1,27 @@
+[package]
+name = "mc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "mc — state-of-the-art Muse Chat CLI (incurs): one typed command graph over the Muse shim, exposed as CLI, MCP, HTTP and OpenAPI"
+
+[[bin]]
+name = "mc"
+path = "src/main.rs"
+
+[dependencies]
+incurs = { version = "0.14", features = ["http", "mcp", "openapi", "yaml"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+async-trait = "0.1"
+futures = "0.3"
+# Direct axum for serving the incurs router with a RequestGuard
+# (incurs::http::serve_http serves unguarded; build_cli_router_with does not bind).
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+
+[dev-dependencies]
+serde_json = "1"
