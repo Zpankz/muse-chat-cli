@@ -137,12 +137,13 @@ impl ShimClient {
     /// Carries its own short deadline: the client builder sets only a
     /// connect timeout (chat turns legitimately run minutes), so without
     /// this a shim that accepts the connection but never responds would
-    /// hang every command on the probe.
+    /// hang every command on the probe. Allow the browser's normal
+    /// eight-second composer wait on sign-in pages, plus response overhead.
     pub async fn health(&self) -> Result<Value, ShimError> {
         let res = self
             .http
             .get(self.url("/health"))
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(12))
             .send()
             .await
             .map_err(|e| ShimError::unreachable(&self.base, e))?;
@@ -1007,6 +1008,35 @@ mod tests {
         .await;
         let want: Vec<usize> = (0..40usize).collect();
         assert_eq!(many, want);
+    }
+
+    #[tokio::test]
+    async fn health_allows_browser_sign_in_status_delay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed mid-request");
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let body = br#"{"ok":true,"models":[],"browserRunning":true}"#;
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()
+            ).as_bytes()).await.unwrap();
+            // Browser status waits up to eight seconds for the composer
+            // when the browser is on the sign-in page.
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            let _ = socket.write_all(body).await;
+        });
+        let health = super::ShimClient::new(&base).unwrap().health().await;
+        server.await.unwrap();
+        assert!(health.is_ok(), "normal browser health delay: {health:?}");
     }
 
     /// `chat_batch` against a raw `tokio` `TcpListener` speaking minimal
